@@ -1,0 +1,17 @@
+# secrets — never commit real keys
+.env
+.env.*
+!.env.example
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+build/
+dist/
+
+# runtime artifacts
+ledger/
+*.log
