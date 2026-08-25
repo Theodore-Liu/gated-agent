@@ -8,7 +8,8 @@ Built for the Alpaca AI Trading Agents Hackathon (Aug 28 – Sep 4, 2026). MIT l
 
 Most trading-agent demos put the LLM in charge of finding alpha. We think that's
 backwards. Here the signal is deliberately a **toy from public literature** —
-Faber's 10-month SMA trend rule on SPY/QQQ/IWM — and all the engineering goes
+Faber's 10-month SMA trend rule on SPY/QQQ/IWM plus mega-cap single names
+(AAPL, NVDA) — and all the engineering goes
 into the part that actually keeps accounts alive: **discipline**.
 
 > **Toy signal, real discipline.** The signal is honest about being simple.
@@ -36,7 +37,7 @@ do the other's job.
 flowchart TD
     RUN["python -m gated_agent.run<br/>(daily · idempotent per day)"]
     RUN --> EXITS["position_manager.py — runs BEFORE any new open<br/>frozen close rules R1–R4 (config/close_rules.json):<br/>R1 DTE≤2 · R2/R3 TP/SL ±50% · R4 flip-close · quote-gap force-close"]
-    RUN --> SIG["signals.py<br/>toy: Faber 10-mo SMA (SPY/QQQ/IWM)<br/>{symbol, direction, strength, spot}"]
+    RUN --> SIG["signals.py<br/>toy: Faber 10-mo SMA<br/>(SPY/QQQ/IWM + AAPL/NVDA)<br/>{symbol, direction, strength, spot}"]
     RUN --> NEG["negctl.py<br/>seeded RANDOM signal<br/>same contract shape"]
 
     SIG --> CHAIN["chain_fetcher.py<br/>Alpaca contracts + snapshots (quotes + greeks)<br/>no keys → labeled synthetic chain"]

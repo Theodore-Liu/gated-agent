@@ -45,3 +45,11 @@ def test_strength_saturates_at_one():
 def test_insufficient_history_raises():
     with pytest.raises(ValueError):
         compute_signal("SPY", [100.0] * (SMA_DAYS - 1))
+
+
+def test_universe_covers_etfs_and_single_names():
+    """Competition universe: calm ETF core + two mega-cap single names with
+    no earnings inside the 8/28-9/4 window (checked 2026-08-25). The mapper
+    and gates are underlying-agnostic; this pins the demo scope."""
+    from gated_agent.signals import UNIVERSE
+    assert UNIVERSE == ("SPY", "QQQ", "IWM", "AAPL", "NVDA")

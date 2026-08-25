@@ -24,7 +24,10 @@ SMA_DAYS = 210          # ~10 months x 21 trading days
 FULL_STRENGTH_PCT = 0.05  # 5% from SMA -> strength 1.0
 NEUTRAL_BAND_PCT = 0.005  # within 0.5% of SMA -> neutral
 
-UNIVERSE = ("SPY", "QQQ", "IWM")
+# ETFs for the calm core; two mega-cap single names (top-tier option
+# liquidity, no earnings inside the competition window) to demonstrate
+# the same gates handle single-stock chains unchanged.
+UNIVERSE = ("SPY", "QQQ", "IWM", "AAPL", "NVDA")
 
 
 def compute_signal(symbol: str, closes: list[float]) -> dict:
