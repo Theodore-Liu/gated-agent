@@ -56,6 +56,24 @@ def test_load_env_missing_file_is_noop(tmp_path, monkeypatch):
     assert load_env(tmp_path / "nope.env") == {}
 
 
+def test_load_env_skips_template_placeholders(tmp_path, monkeypatch):
+    """An unedited .env.example line must behave as absent — a placeholder
+    ANTHROPIC_API_KEY would otherwise activate the LLM red-teamer with a
+    bogus key and fail-closed veto every order."""
+    clear_keys(monkeypatch)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    env = tmp_path / ".env"
+    env.write_text("ANTHROPIC_API_KEY=your_key_here\n"
+                   "ALPACA_API_KEY=your_paper_key_here\n"
+                   "ALPACA_SECRET_KEY=real-secret\n", encoding="utf-8")
+    loaded = load_env(env)
+    import os
+    assert "ANTHROPIC_API_KEY" not in os.environ
+    assert "ALPACA_API_KEY" not in os.environ
+    assert os.environ["ALPACA_SECRET_KEY"] == "real-secret"
+    assert set(loaded) == {"ALPACA_SECRET_KEY"}
+
+
 # ── broker selection ─────────────────────────────────────────────────────
 
 def test_no_keys_selects_stub(tmp_path, monkeypatch):

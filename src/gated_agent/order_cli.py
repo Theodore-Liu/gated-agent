@@ -172,6 +172,9 @@ class AlpacaCLIBroker(Broker):
 def load_env(path: str | os.PathLike = ".env") -> dict[str, str]:
     """Minimal .env loader (no extra dependency). KEY=VALUE lines, `#`
     comments; never overwrites variables already set in the environment.
+    Template placeholders (``your_..._here``) are skipped: an unedited line
+    copied from .env.example must behave as absent, not poison feature
+    switches that test for key presence (e.g. the red-team activation).
     Accepts both naming schemes and mirrors ALPACA_API_KEY_ID /
     ALPACA_API_SECRET_KEY onto the ALPACA_API_KEY / ALPACA_SECRET_KEY names
     that chain_fetcher reads. Missing file -> no-op (stub mode)."""
@@ -184,6 +187,8 @@ def load_env(path: str | os.PathLike = ".env") -> dict[str, str]:
                 continue
             k, _, v = line.partition("=")
             k, v = k.strip(), v.strip().strip('"').strip("'")
+            if v.startswith("your_") and v.endswith("_here"):
+                continue
             if k and k not in os.environ:
                 os.environ[k] = v
                 loaded[k] = v

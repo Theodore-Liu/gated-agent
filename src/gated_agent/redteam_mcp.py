@@ -319,8 +319,11 @@ class McpRedTeam(RedTeam):
 
 
 def redteam_from_env() -> RedTeam:
-    """ANTHROPIC_API_KEY present (env or already loaded .env) -> McpRedTeam;
-    absent -> StubRedTeam. Tests and keyless clones stay fully offline."""
-    if os.environ.get("ANTHROPIC_API_KEY"):
+    """GATED_AGENT_REDTEAM=llm (explicit opt-in — claude CLI then uses its own
+    login/subscription auth, no API key required) or ANTHROPIC_API_KEY present
+    -> McpRedTeam; otherwise StubRedTeam. Tests and keyless clones stay fully
+    offline."""
+    if (os.environ.get("GATED_AGENT_REDTEAM", "").lower() == "llm"
+            or os.environ.get("ANTHROPIC_API_KEY")):
         return McpRedTeam()
     return StubRedTeam()

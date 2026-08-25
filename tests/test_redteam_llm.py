@@ -97,9 +97,18 @@ def test_llm_cannot_approve_past_vetoed_question(monkeypatch, tmp_path):
 
 def test_redteam_from_env_switch(monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("GATED_AGENT_REDTEAM", raising=False)
     assert isinstance(redteam_from_env(), StubRedTeam)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
     assert isinstance(redteam_from_env(), McpRedTeam)
+
+
+def test_redteam_from_env_explicit_llm_needs_no_key(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("GATED_AGENT_REDTEAM", "llm")
+    assert isinstance(redteam_from_env(), McpRedTeam)
+    monkeypatch.setenv("GATED_AGENT_REDTEAM", "stub")
+    assert isinstance(redteam_from_env(), StubRedTeam)
 
 
 def test_readonly_allowlist_has_no_order_tools():
