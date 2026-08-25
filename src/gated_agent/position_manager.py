@@ -269,6 +269,11 @@ def check_positions(flips: dict | None = None, *, dry_run: bool = True,
 
 if __name__ == "__main__":
     import sys
+    # 08-25 live-test R2 finding: the standalone entry (the afternoon
+    # scheduled task's payload) never loaded .env — keys were only loaded
+    # by run.main(), so this path fail-crashed on a box that relies on .env.
+    from .order_cli import load_env
+    load_env()
     flips = {}
     for a in sys.argv[1:]:
         if a.startswith("--flip="):
