@@ -6,7 +6,13 @@ again the same day is a no-op (use --force to override, dedup still holds).
 Pipeline per symbol (identical for live and shadow books; only the live book
 may reach the order path):
 
+    close checks (position_manager R1-R4)  -- BEFORE any new open
     signal -> options_mapper -> risk gates -> red-team review -> order intent
+
+Ordering matters for R4/flip coordination: a reverse signal first drives a
+close through position_manager (same mleg path), whose `position_closed`
+ledger record is exactly what the direction-flip gate reads -- so the reverse
+open is admitted only after the conflicting close went through.
 """
 from __future__ import annotations
 
@@ -14,12 +20,12 @@ import argparse
 import sys
 from datetime import date
 
-from . import negctl, signals
+from . import negctl, position_manager, signals
 from .gates import dedup_key, run_gates
 from .ledger import Ledger
 from .options_mapper import MapperConfig, map_signal
 from .order_cli import AlpacaCLIBroker, Broker, broker_from_env
-from .redteam_mcp import RedTeam, StubRedTeam
+from .redteam_mcp import RedTeam, StubRedTeam, redteam_from_env
 
 
 def process(symbol: str, signal: dict, book: str, *, broker: Broker,
@@ -89,6 +95,31 @@ def process(symbol: str, signal: dict, book: str, *, broker: Broker,
     return result
 
 
+def close_checks(sigs: dict, *, ledger: Ledger, run_date: str, today: date,
+                 dry_run: bool = True, **inject) -> list:
+    """Run position_manager's R1-R4 over every open structure BEFORE any new
+    open. R4 flips are derived here: today's live signal direction vs. the
+    ledger's open direction. Confirmed closes append `position_closed`, which
+    is what the direction-flip gate reads — same-day reverse entries are
+    admitted only after their conflicting close went through the mleg path."""
+    flips: dict = {}
+    if position_manager.FLIP_CLOSE:
+        for symbol, sig in sigs.items():
+            open_dir = ledger.open_direction(symbol, book="live")
+            if open_dir and sig["direction"] in ("long", "short") \
+                    and sig["direction"] != open_dir:
+                flips[symbol] = True
+    records = position_manager.check_positions(
+        flips=flips, dry_run=dry_run, today=today,
+        ledger=ledger, run_date=run_date, **inject)
+    for r in records:
+        rule = f" ({r['rule']})" if r.get("rule") else ""
+        print(f"  [close] {r['underlying']}: {r['action']}{rule} — {r['why']}")
+    if not records:
+        print("  [close] no open option structures")
+    return records
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="python -m gated_agent.run")
     ap.add_argument("--dry-run", action="store_true",
@@ -128,13 +159,32 @@ def main(argv: list[str] | None = None) -> int:
               file=sys.stderr)
         return 2
 
-    redteam = StubRedTeam()
+    redteam = redteam_from_env()
+    rt_name = ("MCP red-team" if not isinstance(redteam, StubRedTeam)
+               else "stub red-team")
     mode = "LIVE paper orders" if args.live else "dry run"
     data = "real Alpaca chain" if real else "synthetic chain"
     print(f"gated-agent {mode} — {run_date} "
-          f"(equity ${broker.get_equity():,.0f}, {data}, stub red-team)")
+          f"(equity ${broker.get_equity():,.0f}, {data}, {rt_name})")
+
+    sigs = {s: signals.live_signal(s) for s in signals.UNIVERSE}  # yfinance
+
+    # Close checks come FIRST: exits (R1-R4, pre-registered config) run before
+    # any new open, so a flip closes the old structure before the flip guard
+    # is consulted for the reverse entry.
+    if real:
+        try:
+            close_checks(sigs, ledger=ledger, run_date=run_date, today=today,
+                         dry_run=not args.live)
+        except Exception as e:  # noqa: BLE001 — a failed close round must not
+            # kill the run; unclosed positions keep the flip guard engaged.
+            print(f"  [close] check failed ({type(e).__name__}: {e}); "
+                  f"flip guard stays engaged for affected symbols")
+    else:
+        print("  [close] stub broker (no Alpaca keys): no positions to check")
+
     for symbol in signals.UNIVERSE:
-        sig = signals.live_signal(symbol)          # live yfinance closes
+        sig = sigs[symbol]
         print(f"{symbol}: {sig['direction']} strength={sig['strength']:.2f} "
               f"spot={sig['spot']:.2f} (10-mo SMA trend)")
         process(symbol, sig, "live", broker=broker, ledger=ledger,
