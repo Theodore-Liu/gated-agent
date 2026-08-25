@@ -4,20 +4,29 @@ Design: the LLM (red-team loop) can only VETO; it can never construct or
 mutate an order. Orders are built by pure code and would be submitted through
 the Alpaca CLI as an auditable subprocess call.
 
-The account does not exist yet, so the CLI is stubbed behind the `Broker`
-interface below:
+Two implementations sit behind the `Broker` interface:
 
-  * `cli_command()` builds the exact argv we intend to run — this is real and
-    tested today.
-  * `StubCLIBroker` synthesizes an option chain (clearly labeled synthetic;
-    swap for `alpaca options chain` / the market-data API once keys exist)
-    and, in dry-run mode, logs the intended command instead of executing it.
-  * Live submission raises NotImplementedError until the account is wired.
+  * `StubCLIBroker` — synthesizes an option chain (clearly labeled synthetic)
+    and logs the intended command instead of executing it. Used whenever no
+    Alpaca keys are configured; keeps tests and the demo fully offline.
+  * `AlpacaCLIBroker` — the real path: option chain + equity from Alpaca's
+    read-only APIs (chain_fetcher) and order submission through the official
+    Alpaca CLI (cli_executor, `--order-class mleg`, atomic spreads). Defaults
+    to the CLI's own --dry-run; a real order additionally requires
+    ALPACA_HACKATHON_LIVE=1 (enforced in cli_executor — belt and braces).
+
+`broker_from_env()` picks between them: keys in the environment / .env give
+the real adapter (still dry-run by default), no keys means stub — so a fresh
+clone with no .env behaves exactly as before.
 """
 from __future__ import annotations
 
+import os
 from abc import ABC, abstractmethod
 from datetime import date, timedelta
+from pathlib import Path
+
+from . import chain_fetcher, cli_executor
 
 
 # ── OCC symbology helpers ────────────────────────────────────────────────
@@ -113,7 +122,89 @@ class StubCLIBroker(Broker):
             self.submitted.append(record)
             return record
         raise NotImplementedError(
-            "Live submission awaits the Alpaca paper account: wire real keys "
-            "from .env and replace StubCLIBroker with a subprocess runner for "
-            "the argv from cli_command()."
+            "StubCLIBroker never submits. Configure Alpaca keys in .env so "
+            "broker_from_env() returns AlpacaCLIBroker instead."
         )
+
+
+class AlpacaCLIBroker(Broker):
+    """Real adapter: Alpaca read-only APIs for data, official Alpaca CLI for
+    orders (one atomic mleg submission per spread).
+
+    dry_run=True (default) passes --dry-run to the CLI: full request built and
+    echoed by Alpaca's own tooling, nothing submitted. dry_run=False submits
+    for real and is additionally hard-gated on ALPACA_HACKATHON_LIVE=1 inside
+    cli_executor.submit_legs.
+
+    `executor` is injectable for tests (no subprocess, no binary needed).
+    """
+
+    def __init__(self, dry_run: bool = True, executor=None):
+        self.dry_run = dry_run
+        self._executor = executor or cli_executor.submit_legs
+        self.submitted: list[dict] = []   # test hook, same as the stub
+
+    def get_equity(self) -> float:
+        return chain_fetcher.fetch_equity()
+
+    def get_option_chain(self, symbol: str, spot: float, today: date) -> list[dict]:
+        # spot is unused: the chain window is DTE-based; quotes come live.
+        return chain_fetcher.fetch_chain(symbol, today)
+
+    def submit_order(self, symbol: str, legs: list[dict], dedup_key: str) -> dict:
+        res = self._executor(legs, dry_run=self.dry_run)
+        if not res.ok:
+            status = "error"
+        elif res.dry_run:
+            status = "dry_run"
+        else:
+            status = "submitted"
+        record = {"symbol": symbol, "legs": legs, "dedup_key": dedup_key,
+                  "cli_commands": [cli_executor.build_command_preview(legs)],
+                  "status": status, "ok": res.ok, "raw": res.raw,
+                  "request": res.request}
+        self.submitted.append(record)
+        return record
+
+
+# ── environment wiring ───────────────────────────────────────────────────
+
+def load_env(path: str | os.PathLike = ".env") -> dict[str, str]:
+    """Minimal .env loader (no extra dependency). KEY=VALUE lines, `#`
+    comments; never overwrites variables already set in the environment.
+    Accepts both naming schemes and mirrors ALPACA_API_KEY_ID /
+    ALPACA_API_SECRET_KEY onto the ALPACA_API_KEY / ALPACA_SECRET_KEY names
+    that chain_fetcher reads. Missing file -> no-op (stub mode)."""
+    loaded: dict[str, str] = {}
+    p = Path(path)
+    if p.exists():
+        for line in p.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            k, v = k.strip(), v.strip().strip('"').strip("'")
+            if k and k not in os.environ:
+                os.environ[k] = v
+                loaded[k] = v
+    for src, dst in (("ALPACA_API_KEY_ID", "ALPACA_API_KEY"),
+                     ("ALPACA_API_SECRET_KEY", "ALPACA_SECRET_KEY")):
+        if os.environ.get(src) and not os.environ.get(dst):
+            os.environ[dst] = os.environ[src]
+            loaded[dst] = os.environ[src]
+    return loaded
+
+
+def have_alpaca_keys() -> bool:
+    return bool(os.environ.get("ALPACA_API_KEY")
+                and os.environ.get("ALPACA_SECRET_KEY"))
+
+
+def broker_from_env(dry_run: bool = True,
+                    env_file: str | os.PathLike = ".env") -> Broker:
+    """Keys present (env or .env) -> AlpacaCLIBroker; absent -> StubCLIBroker.
+    Placeholder values from .env.example are treated as absent."""
+    load_env(env_file)
+    if have_alpaca_keys() and "your_" not in os.environ["ALPACA_API_KEY"]:
+        return AlpacaCLIBroker(dry_run=dry_run)
+    return StubCLIBroker(dry_run=True)

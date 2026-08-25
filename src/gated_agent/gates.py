@@ -1,10 +1,16 @@
 """Deterministic risk gates. Every order passes through all of them; any veto
 kills the order. Fail-closed: a structure the gates cannot price is vetoed.
 
-Gates (agreed architecture):
+Gates (agreed architecture, contract v1 with the signal side):
   1. Position size  — worst-case loss of the order <= 5% of equity.
   2. Daily loss halt — if today's realized PnL <= -2% of equity, no new orders.
   3. Idempotent dedup — the same (day, symbol, legs) order is never sent twice.
+  4. Direction flip — while a position in a symbol is open, no order in the
+     opposite direction is allowed. Exits belong to deterministic exit rules
+     (DTE / take-profit / stop-loss, pre-registered config), not to a reverse
+     signal — so a flip must wait until the exit rules have closed the
+     conflicting position. This also bans hedged (long+short same symbol)
+     books outright.
 
 No LLM anywhere in this file. The red-team loop is a *separate*, additional
 veto layer; these arithmetic gates run first and cannot be talked out of.
@@ -108,6 +114,24 @@ def dedup_key(run_date: str, symbol: str, legs: list[dict]) -> str:
     return hashlib.sha256(canon.encode("utf-8")).hexdigest()[:16]
 
 
+def direction_flip_gate(direction: str,
+                        open_direction: str | None) -> GateResult:
+    """Contract v1: never open against an existing position in the same symbol.
+
+    `open_direction` is the direction of the currently open position for this
+    symbol (from the ledger's fills stub until real fills exist), or None.
+    Same-direction re-entry is left to the dedup/sizing gates; a *reverse*
+    open is vetoed until the exit rules have closed the position.
+    """
+    if open_direction is not None and direction in ("long", "short") \
+            and direction != open_direction:
+        return GateResult(
+            "direction_flip", False,
+            f"open {open_direction} position conflicts with new {direction} "
+            f"order; exit rules must close it first (no hedged positions)")
+    return GateResult("direction_flip", True, "no conflicting open position")
+
+
 def dedup_gate(key: str, already_seen: bool) -> GateResult:
     if already_seen:
         return GateResult("dedup", False,
@@ -118,13 +142,15 @@ def dedup_gate(key: str, already_seen: bool) -> GateResult:
 # ── combined ─────────────────────────────────────────────────────────────
 
 def run_gates(*, legs: list[dict], strikes: dict[str, dict], equity: float,
-              realized_pnl_today: float, key: str,
-              already_seen: bool) -> tuple[bool, list[GateResult], float | None]:
+              realized_pnl_today: float, key: str, already_seen: bool,
+              direction: str = "neutral", open_direction: str | None = None,
+              ) -> tuple[bool, list[GateResult], float | None]:
     """Run all gates. Returns (allowed, results, max_loss)."""
     max_loss = estimate_max_loss(legs, strikes)
     results = [
         daily_loss_halt_gate(realized_pnl_today, equity),
         position_size_gate(max_loss, equity),
         dedup_gate(key, already_seen),
+        direction_flip_gate(direction, open_direction),
     ]
     return all(r.allowed for r in results), results, max_loss

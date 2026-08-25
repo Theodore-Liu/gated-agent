@@ -61,6 +61,26 @@ class Ledger:
                    for r in self.records()
                    if r["kind"] in ("order_intent", "order_submitted"))
 
+    def open_direction(self, symbol: str, book: str = "live") -> str | None:
+        """Direction ("long" | "short") of the currently open position in
+        `symbol` for this book, or None.
+
+        Position-state stub until real fills exist (contract v1 flip guard):
+        an order intent / submission / shadow-would-trade record carrying a
+        `direction` field opens a position; a `position_closed` record for the
+        symbol (to be written by the exit rules once live) closes it.
+        """
+        cur: str | None = None
+        for r in self.records():
+            if r["book"] != book or r.get("symbol") != symbol:
+                continue
+            if r["kind"] in ("order_intent", "order_submitted",
+                             "shadow_would_trade") and r.get("direction"):
+                cur = r["direction"]
+            elif r["kind"] == "position_closed":
+                cur = None
+        return cur
+
     def run_complete(self, run_date: str) -> bool:
         return any(r["kind"] == "run_complete" and r["run_date"] == run_date
                    for r in self.records())

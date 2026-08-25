@@ -18,7 +18,7 @@ from . import negctl, signals
 from .gates import dedup_key, run_gates
 from .ledger import Ledger
 from .options_mapper import MapperConfig, map_signal
-from .order_cli import Broker, StubCLIBroker
+from .order_cli import AlpacaCLIBroker, Broker, broker_from_env
 from .redteam_mcp import RedTeam, StubRedTeam
 
 
@@ -48,6 +48,8 @@ def process(symbol: str, signal: dict, book: str, *, broker: Broker,
         legs=legs, strikes=strikes, equity=equity,
         realized_pnl_today=ledger.realized_pnl(run_date), key=key,
         already_seen=(book == "live" and ledger.seen_order(key)),
+        direction=signal["direction"],
+        open_direction=ledger.open_direction(symbol, book=book),
     )
     ledger.append(run_date, book, "gate_check", symbol=symbol, legs=legs,
                   max_loss=max_loss, dedup_key=key,
@@ -69,7 +71,8 @@ def process(symbol: str, signal: dict, book: str, *, broker: Broker,
     if book != "live":
         # shadow book stops here by construction: no order path, ever
         ledger.append(run_date, book, "shadow_would_trade", symbol=symbol,
-                      legs=legs, max_loss=max_loss, dedup_key=key)
+                      legs=legs, max_loss=max_loss, dedup_key=key,
+                      direction=signal["direction"])
         print(f"  [{book}] {symbol}: would trade {len(legs)} leg(s) "
               f"(max loss ${max_loss:,.0f}) — shadow only, not sent")
         return None
@@ -77,19 +80,23 @@ def process(symbol: str, signal: dict, book: str, *, broker: Broker,
     result = broker.submit_order(symbol, legs, key)
     ledger.append(run_date, book, "order_intent", symbol=symbol, legs=legs,
                   max_loss=max_loss, dedup_key=key, status=result["status"],
+                  direction=signal["direction"],
                   cli_commands=result["cli_commands"])
     print(f"  [{book}] {symbol}: ORDER INTENT ({result['status']}) — "
           f"max loss ${max_loss:,.0f}")
     for cmd in result["cli_commands"]:
-        print("      $ " + " ".join(cmd))
+        print("      $ " + (cmd if isinstance(cmd, str) else " ".join(cmd)))
     return result
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="python -m gated_agent.run")
     ap.add_argument("--dry-run", action="store_true",
-                    help="print intended orders; never submit (required until "
-                         "the Alpaca account exists)")
+                    help="build orders and pass them through the CLI's "
+                         "--dry-run; never submit")
+    ap.add_argument("--live", action="store_true",
+                    help="submit real paper orders — requires Alpaca keys in "
+                         ".env AND ALPACA_HACKATHON_LIVE=1 in the environment")
     ap.add_argument("--date", default=None,
                     help="override run date YYYY-MM-DD (default: today)")
     ap.add_argument("--force", action="store_true",
@@ -97,9 +104,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--ledger", default=None, help="ledger JSONL path override")
     args = ap.parse_args(argv)
 
-    if not args.dry_run:
-        print("Live mode awaits the Alpaca paper account — run with --dry-run.",
-              file=sys.stderr)
+    if not args.dry_run and not args.live:
+        print("Pass --dry-run (safe default) or --live (real paper orders; "
+              "needs keys + ALPACA_HACKATHON_LIVE=1).", file=sys.stderr)
+        return 2
+    if args.dry_run and args.live:
+        print("--dry-run and --live are mutually exclusive.", file=sys.stderr)
         return 2
 
     today = date.fromisoformat(args.date) if args.date else date.today()
@@ -111,11 +121,18 @@ def main(argv: list[str] | None = None) -> int:
               f"(--force to override).")
         return 0
 
-    broker = StubCLIBroker(dry_run=True)
-    redteam = StubRedTeam()
+    broker = broker_from_env(dry_run=not args.live)
+    real = isinstance(broker, AlpacaCLIBroker)
+    if args.live and not real:
+        print("--live needs Alpaca keys in .env (none found) — refusing.",
+              file=sys.stderr)
+        return 2
 
-    print(f"gated-agent dry run — {run_date} "
-          f"(equity ${broker.get_equity():,.0f}, synthetic chain, stub red-team)")
+    redteam = StubRedTeam()
+    mode = "LIVE paper orders" if args.live else "dry run"
+    data = "real Alpaca chain" if real else "synthetic chain"
+    print(f"gated-agent {mode} — {run_date} "
+          f"(equity ${broker.get_equity():,.0f}, {data}, stub red-team)")
     for symbol in signals.UNIVERSE:
         sig = signals.live_signal(symbol)          # live yfinance closes
         print(f"{symbol}: {sig['direction']} strength={sig['strength']:.2f} "

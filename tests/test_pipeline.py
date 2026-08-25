@@ -53,6 +53,33 @@ def test_shadow_book_never_reaches_broker(tmp_path):
     assert ledger.day(RUN_DATE, "live") == []        # live book untouched
 
 
+def test_flip_guard_blocks_reverse_open_across_days(tmp_path):
+    broker, ledger, rt = setup(tmp_path)
+    first = process("SPY", dict(STRONG_LONG), "live", broker=broker,
+                    ledger=ledger, redteam=rt, run_date=RUN_DATE, today=TODAY)
+    assert first is not None                          # long position now open
+
+    from datetime import date as _date
+    day2 = _date(2026, 8, 25)
+    strong_short = {"symbol": "SPY", "direction": "short", "strength": 0.9,
+                    "spot": 640.0}
+    second = process("SPY", strong_short, "live", broker=broker, ledger=ledger,
+                     redteam=rt, run_date=day2.isoformat(), today=day2)
+    assert second is None                             # flip refused
+    assert len(broker.submitted) == 1
+    checks = [r for r in ledger.day(day2.isoformat(), "live")
+              if r["kind"] == "gate_check"]
+    flip = [g for g in checks[0]["results"] if g["gate"] == "direction_flip"]
+    assert flip and not flip[0]["allowed"]
+
+    # after the exit rules close the position, the short may open
+    ledger.append(day2.isoformat(), "live", "position_closed", symbol="SPY")
+    day3 = _date(2026, 8, 26)
+    third = process("SPY", strong_short, "live", broker=broker, ledger=ledger,
+                    redteam=rt, run_date=day3.isoformat(), today=day3)
+    assert third is not None
+
+
 def test_negctl_signal_contract_and_determinism():
     a = negctl.random_signal("2026-08-24", "SPY", 640.0)
     b = negctl.random_signal("2026-08-24", "SPY", 640.0)

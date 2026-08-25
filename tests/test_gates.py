@@ -6,8 +6,10 @@ from gated_agent.gates import (
     daily_loss_halt_gate,
     dedup_gate,
     dedup_key,
+    direction_flip_gate,
     estimate_max_loss,
     position_size_gate,
+    run_gates,
 )
 
 STRIKES = {
@@ -73,3 +75,28 @@ def test_dedup_key_stable_and_distinct():
 def test_dedup_gate_vetoes_seen():
     assert dedup_gate("abc", already_seen=False).allowed
     assert not dedup_gate("abc", already_seen=True).allowed
+
+
+def test_flip_gate_vetoes_reverse_open():
+    # contract v1: while a long position is open, a short open is refused
+    # until the exit rules have closed it (and vice versa)
+    assert not direction_flip_gate("short", "long").allowed
+    assert not direction_flip_gate("long", "short").allowed
+
+
+def test_flip_gate_allows_same_direction_and_flat():
+    assert direction_flip_gate("long", "long").allowed     # add-on/re-entry:
+    assert direction_flip_gate("short", "short").allowed   # dedup gate's job
+    assert direction_flip_gate("long", None).allowed       # flat book
+    assert direction_flip_gate("neutral", "long").allowed  # neutral never opens
+
+
+def test_run_gates_includes_flip_verdict():
+    legs = [{"occ_symbol": "C640", "side": "buy", "qty": 1, "limit": 5.0}]
+    allowed, results, _ = run_gates(
+        legs=legs, strikes=STRIKES, equity=100_000.0, realized_pnl_today=0.0,
+        key="k", already_seen=False, direction="short", open_direction="long")
+    assert not allowed
+    by_gate = {r.gate: r for r in results}
+    assert not by_gate["direction_flip"].allowed
+    assert "no hedged positions" in by_gate["direction_flip"].reason

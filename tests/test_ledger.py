@@ -36,6 +36,25 @@ def test_run_complete_flag(tmp_path):
     assert not led.run_complete("2026-08-25")
 
 
+def test_open_direction_tracks_open_and_close(tmp_path):
+    led = make(tmp_path)
+    assert led.open_direction("SPY") is None
+    led.append("2026-08-24", "live", "order_intent", symbol="SPY",
+               direction="long", dedup_key="k1")
+    assert led.open_direction("SPY") == "long"
+    assert led.open_direction("QQQ") is None            # per-symbol
+    led.append("2026-08-26", "live", "position_closed", symbol="SPY")
+    assert led.open_direction("SPY") is None            # exit rules closed it
+
+
+def test_open_direction_books_are_isolated(tmp_path):
+    led = make(tmp_path)
+    led.append("2026-08-24", "shadow", "shadow_would_trade", symbol="SPY",
+               direction="short", dedup_key="k1")
+    assert led.open_direction("SPY", book="live") is None
+    assert led.open_direction("SPY", book="shadow") == "short"
+
+
 def test_realized_pnl_sums_fills(tmp_path):
     led = make(tmp_path)
     led.append("2026-08-24", "live", "fill", pnl=-1500.0)
