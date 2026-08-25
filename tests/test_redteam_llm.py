@@ -26,6 +26,7 @@ def test_review_signature_matches_stub():
 
 def test_fail_closed_when_cli_missing(monkeypatch, tmp_path):
     """No claude binary -> infrastructure failure -> full veto, valid protocol."""
+    monkeypatch.delenv("CLAUDE_BIN", raising=False)
     monkeypatch.setattr(rt, "CLAUDE_BIN",
                         str(tmp_path / "definitely-not-claude.exe"))
     monkeypatch.setattr(rt, "_ROOT", tmp_path)   # sandbox/mcp-config in tmp

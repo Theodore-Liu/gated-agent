@@ -158,6 +158,7 @@ def test_quote_gap_state_persists_across_rounds(sandbox):
 def test_mcp_redteam_fail_closed_through_pipeline(tmp_path, monkeypatch):
     """McpRedTeam wired into process(): with no claude binary the review
     fail-closes and the pipeline records a red-team veto — no order intent."""
+    monkeypatch.delenv("CLAUDE_BIN", raising=False)
     monkeypatch.setattr(rt, "CLAUDE_BIN", str(tmp_path / "no-claude"))
     monkeypatch.setattr(rt, "_ROOT", tmp_path)
     broker, ledger = StubCLIBroker(dry_run=True), Ledger(tmp_path / "l.jsonl")

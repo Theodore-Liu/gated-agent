@@ -159,7 +159,14 @@ QUESTION_IDS = ("max_loss_scenario", "greeks_exposure", "liquidity_exit")
 
 _ROOT = Path(__file__).resolve().parents[2]          # src/gated_agent -> repo
 # Windows: `claude` is a .cmd shim; subprocess without shell needs the real path.
-CLAUDE_BIN = os.environ.get("CLAUDE_BIN") or shutil.which("claude") or "claude"
+CLAUDE_BIN = shutil.which("claude") or "claude"
+
+
+def _claude_bin() -> str:
+    """Resolve at CALL time, env first: .env is loaded after module import,
+    and a scheduled-task context may have no claude on PATH — an import-time
+    constant would freeze before CLAUDE_BIN from .env can take effect."""
+    return os.environ.get("CLAUDE_BIN") or CLAUDE_BIN
 
 READONLY_TOOLS = ",".join([
     "mcp__alpaca__get_account_info",
@@ -267,7 +274,7 @@ class McpRedTeam(RedTeam):
                                        symbol=symbol, max_loss=max_loss,
                                        equity=equity)
             r = subprocess.run(
-                [CLAUDE_BIN, "-p", "--mcp-config", _mcp_config(),
+                [_claude_bin(), "-p", "--mcp-config", _mcp_config(),
                  "--allowedTools", READONLY_TOOLS,
                  "--output-format", "json", "--model", "sonnet"],
                 input=prompt, cwd=str(sandbox), capture_output=True, text=True,
