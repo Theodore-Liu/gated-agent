@@ -15,3 +15,9 @@ dist/
 # runtime artifacts
 ledger/
 *.log
+logs/
+
+# Alpaca CLI binary — drop the official release into bin/, never commit it
+bin/*.exe
+bin/*.zip
+bin/alpaca

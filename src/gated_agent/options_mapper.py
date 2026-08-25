@@ -18,7 +18,7 @@ Design choices (documented for the one-pager):
 - Moneyness-based strike selection (ATM buy leg, ~2-3% OTM sell leg) instead of
   delta targets: works without greeks (indicative feed has none) and is easier
   to explain. Effectively delta ~0.5 / ~0.2-0.3 at short expiries.
-- Defined-risk structures only (debit/credit spreads, cash-secured puts) --
+- Defined-risk structures only (debit and credit spreads) --
   paper options level 3 allows them, and max loss is computable at entry,
   which the risk gate needs.
 - Every rule is deterministic: same inputs -> same legs. No LLM anywhere here.
@@ -42,10 +42,6 @@ class MapperConfig:
     # sizing
     equity: float = 100_000.0
     max_loss_frac: float = 0.01       # per-trade max loss <= 1% of equity
-    # One CSP on a $500 underlying ties up $50k. On a $100k account that is
-    # half the equity -- deliberate: the income tier holds ONE collateralised
-    # position at a time. Lower this if trading cheaper underlyings.
-    csp_collateral_frac: float = 0.50 # cash-secured put collateral cap
     # strength tiers
     strong: float = 0.7
     mild: float = 0.3
@@ -97,6 +93,19 @@ def _nearest_strike(cands: list, target: float) -> dict | None:
     return min(cands, key=lambda c: abs(float(c["strike_price"]) - target))
 
 
+def _select_leg(cands: list, strike_target: float, delta_target: float) -> dict | None:
+    """Prefer delta-based selection when greeks are present, else moneyness.
+
+    Greeks come free on the indicative feed during/after market hours but are
+    absent on stale weekend data -- verified live 2026-08-24. Falling back to
+    moneyness keeps the mapper deterministic and usable at any time.
+    """
+    with_delta = [c for c in cands if c.get("delta") is not None]
+    if with_delta:
+        return min(with_delta, key=lambda c: abs(abs(float(c["delta"])) - delta_target))
+    return _nearest_strike(cands, strike_target)
+
+
 def _same_expiry(cands: list, expiry: str) -> list:
     return [c for c in cands if c["expiration_date"] == expiry]
 
@@ -106,14 +115,14 @@ def _same_expiry(cands: list, expiry: str) -> list:
 def _debit_spread(chain, opt_type, spot, today, cfg):
     """Buy ATM, sell OTM. For calls OTM is above spot; for puts below."""
     cands = _eligible(chain, opt_type, today, cfg)
-    buy = _nearest_strike(cands, spot)
+    buy = _select_leg(cands, spot, 0.50)
     if buy is None:
         return []
     sign = 1 if opt_type == "call" else -1
     sell_target = spot * (1 + sign * cfg.otm_pct)
     sells = [c for c in _same_expiry(cands, buy["expiration_date"])
              if sign * (float(c["strike_price"]) - float(buy["strike_price"])) > 0]
-    sell = _nearest_strike(sells, sell_target)
+    sell = _select_leg(sells, sell_target, 0.25)
     if sell is None:
         return []
     debit = _mid(buy) - _mid(sell)
@@ -132,20 +141,43 @@ def _debit_spread(chain, opt_type, spot, today, cfg):
     ]
 
 
-def _cash_secured_put(chain, spot, today, cfg):
-    """Sell an OTM put, fully collateralised. Mild-bullish income."""
+def _credit_put_spread(chain, spot, today, cfg):
+    """Sell OTM put, buy further-OTM put. Mild-bullish income, defined risk.
+
+    Replaced cash-secured puts after live-data testing: on a $700+ underlying
+    one CSP ties up $70k+ collateral, so it could never fire under any sane
+    collateral cap. A put credit spread expresses the same mild-bullish view
+    with defined risk and works at any underlying price.
+    """
     cands = _eligible(chain, "put", today, cfg)
-    target = spot * (1 - cfg.otm_pct)
+    sell_target = spot * (1 - cfg.otm_pct)
     otm = [c for c in cands if float(c["strike_price"]) < spot]
-    sell = _nearest_strike(otm, target)
+    sell = _select_leg(otm, sell_target, 0.25)
     if sell is None:
         return []
-    collateral = float(sell["strike_price"]) * 100
-    qty = int((cfg.equity * cfg.csp_collateral_frac) // collateral)
+    buys = [c for c in _same_expiry(otm, sell["expiration_date"])
+            if float(c["strike_price"]) < float(sell["strike_price"])]
+    # narrow vertical: adjacent strike below the short leg -> smallest width,
+    # smallest max loss, so the 1% risk budget can actually afford qty >= 1
+    buy = max(buys, key=lambda c: float(c["strike_price"]), default=None)
+    if buy is None:
+        return []
+    credit = _mid(sell) - _mid(buy)
+    if credit <= 0:
+        return []
+    width = (float(sell["strike_price"]) - float(buy["strike_price"])) * 100
+    per_contract_loss = width - credit * 100
+    if per_contract_loss <= 0:
+        return []
+    qty = int((cfg.equity * cfg.max_loss_frac) // per_contract_loss)
     if qty < 1:
         return []
-    return [{"occ_symbol": sell["symbol"], "side": "sell", "qty": qty,
-             "limit": _tick_round(_mid(sell))}]
+    return [
+        {"occ_symbol": sell["symbol"], "side": "sell", "qty": qty,
+         "limit": _tick_round(_mid(sell))},
+        {"occ_symbol": buy["symbol"], "side": "buy", "qty": qty,
+         "limit": _tick_round(_mid(buy))},
+    ]
 
 
 def _credit_call_spread(chain, spot, today, cfg):
@@ -153,12 +185,13 @@ def _credit_call_spread(chain, spot, today, cfg):
     cands = _eligible(chain, "call", today, cfg)
     sell_target = spot * (1 + cfg.otm_pct)
     otm = [c for c in cands if float(c["strike_price"]) > spot]
-    sell = _nearest_strike(otm, sell_target)
+    sell = _select_leg(otm, sell_target, 0.25)
     if sell is None:
         return []
     buys = [c for c in _same_expiry(otm, sell["expiration_date"])
             if float(c["strike_price"]) > float(sell["strike_price"])]
-    buy = _nearest_strike(buys, spot * (1 + 2 * cfg.otm_pct))
+    # narrow vertical: adjacent strike above the short leg (see put spread note)
+    buy = min(buys, key=lambda c: float(c["strike_price"]), default=None)
     if buy is None:
         return []
     credit = _mid(sell) - _mid(buy)
@@ -193,7 +226,7 @@ def map_signal(signal: dict, chain: list, today: date,
     if direction == "long":
         if strength >= cfg.strong:
             return _debit_spread(chain, "call", spot, today, cfg)
-        return _cash_secured_put(chain, spot, today, cfg)
+        return _credit_put_spread(chain, spot, today, cfg)
     if direction == "short":
         if strength >= cfg.strong:
             return _debit_spread(chain, "put", spot, today, cfg)

@@ -24,9 +24,9 @@ def make_chain():
         # intrinsic + decaying time value: ATM rich, OTM visibly cheaper
         tv = max(8.0 - 0.4 * abs(SPOT - k), 0.5)
         m = max(SPOT - k, 0) + tv
-        chain.append(C(f"CALL{k}", "call", float(k), exp, m - 0.05, m + 0.05))
+        chain.append(C(f"CALL{k}", "call", float(k), exp, m - 0.01, m + 0.01))
         p = max(k - SPOT, 0) + tv
-        chain.append(C(f"PUT{k}", "put", float(k), exp, p - 0.05, p + 0.05))
+        chain.append(C(f"PUT{k}", "put", float(k), exp, p - 0.01, p + 0.01))
     return chain
 
 
@@ -51,13 +51,16 @@ class TestTiers(unittest.TestCase):
         self.assertGreater(float(sell["occ_symbol"][4:]), 500)
         self.assertEqual(buy["qty"], sell["qty"])
 
-    def test_mild_long_is_cash_secured_put(self):
+    def test_mild_long_is_credit_put_spread(self):
         legs = map_signal({"symbol": "SPY", "direction": "long",
                            "strength": 0.5, "spot": SPOT}, make_chain(), TODAY)
-        self.assertEqual(len(legs), 1)
-        self.assertEqual(legs[0]["side"], "sell")
-        self.assertIn("PUT", legs[0]["occ_symbol"])
-        self.assertLess(float(legs[0]["occ_symbol"][3:]), SPOT)  # OTM
+        self.assertEqual(len(legs), 2)
+        sell, buy = legs
+        self.assertEqual(sell["side"], "sell")
+        self.assertEqual(buy["side"], "buy")
+        self.assertIn("PUT", sell["occ_symbol"])
+        # both OTM puts, buy further below than sell
+        self.assertLess(float(buy["occ_symbol"][3:]), float(sell["occ_symbol"][3:]))
 
     def test_strong_short_is_put_debit_spread(self):
         legs = map_signal({"symbol": "SPY", "direction": "short",
@@ -121,6 +124,32 @@ class TestGates(unittest.TestCase):
         a = map_signal(sig, make_chain(), TODAY)
         b = map_signal(sig, make_chain(), TODAY)
         self.assertEqual(a, b)
+
+
+class TestDeltaPriority(unittest.TestCase):
+    """The staging mapper prefers delta targets when greeks are present and
+    falls back to moneyness when they are absent (weekend/stale feed)."""
+
+    def test_delta_beats_moneyness_for_buy_leg(self):
+        chain = make_chain()
+        # give every call a delta; make the 0.50-delta contract NOT the ATM one
+        for c in chain:
+            if c["type"] != "call":
+                continue
+            k = float(c["strike_price"])
+            c["delta"] = 0.50 if k == 495.0 else max(
+                0.05, min(0.95, 0.45 - (k - SPOT) * 0.03))
+        legs = map_signal({"symbol": "SPY", "direction": "long",
+                           "strength": 0.9, "spot": SPOT}, chain, TODAY)
+        self.assertEqual(len(legs), 2)
+        self.assertEqual(legs[0]["occ_symbol"], "CALL495")   # delta won
+
+    def test_no_greeks_falls_back_to_moneyness(self):
+        chain = make_chain()                                  # no delta keys
+        legs = map_signal({"symbol": "SPY", "direction": "long",
+                           "strength": 0.9, "spot": SPOT}, chain, TODAY)
+        self.assertEqual(len(legs), 2)
+        self.assertEqual(legs[0]["occ_symbol"], "CALL500")    # ATM by moneyness
 
 
 if __name__ == "__main__":
