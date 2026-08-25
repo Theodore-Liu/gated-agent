@@ -15,6 +15,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
+dashboard = ["streamlit>=1.32"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

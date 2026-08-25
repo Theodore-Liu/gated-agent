@@ -1,0 +1,115 @@
+"""Read-only Streamlit dashboard for the hackathon agent.
+
+Satisfies the mandatory demo-URL requirement (Streamlit is one of the three
+allowed platforms) without exposing any strategy logic: it only RENDERS state
+that the account already shows publicly to its owner -- equity, open
+positions, recent orders, and the agent's decision / close-rule logs.
+
+Deploy (Streamlit Community Cloud):
+  main file path  src/gated_agent/dashboard.py
+  secrets         ALPACA_API_KEY / ALPACA_SECRET_KEY  (paper account)
+Nothing here can place orders. See README "Dashboard" for the full note.
+"""
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import urllib.request
+
+import streamlit as st
+
+TRADING = "https://paper-api.alpaca.markets"
+_ROOT = Path(__file__).resolve().parents[2]           # src/gated_agent -> repo
+
+st.set_page_config(page_title="Gated Agent — Live State", layout="wide")
+
+
+def _headers() -> dict:
+    key = st.secrets.get("ALPACA_API_KEY", os.environ.get("ALPACA_API_KEY", ""))
+    sec = st.secrets.get("ALPACA_SECRET_KEY", os.environ.get("ALPACA_SECRET_KEY", ""))
+    return {"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": sec}
+
+
+@st.cache_data(ttl=60)
+def _get(path: str):
+    req = urllib.request.Request(TRADING + path, headers=_headers())
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.loads(r.read())
+
+
+def _jsonl(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    with open(path, encoding="utf-8") as f:
+        return [json.loads(l) for l in f if l.strip()]
+
+
+st.title("Gated Agent — read-only state")
+st.caption("Alpaca paper account · auto-refreshes each minute · "
+           "no order controls exist on this page")
+
+try:
+    acct = _get("/v2/account")
+except Exception as e:  # noqa: BLE001
+    st.error(f"Account API unreachable: {e}")
+    st.stop()
+
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Equity", f"${float(acct['equity']):,.0f}",
+          f"{float(acct['equity']) - float(acct['last_equity']):+,.0f} today")
+c2.metric("Cash", f"${float(acct['cash']):,.0f}")
+c3.metric("Buying power", f"${float(acct['buying_power']):,.0f}")
+c4.metric("Options level", acct.get("options_trading_level", "?"))
+
+st.subheader("Open positions")
+positions = _get("/v2/positions")
+if positions:
+    st.dataframe([{
+        "symbol": p["symbol"],
+        "qty": p["qty"],
+        "avg entry": p["avg_entry_price"],
+        "market value": f"${float(p['market_value']):,.0f}",
+        "unrealized P&L": f"${float(p['unrealized_pl']):,.2f}",
+    } for p in positions], use_container_width=True)
+else:
+    st.info("No open positions.")
+
+st.subheader("Recent orders")
+orders = _get("/v2/orders?status=all&limit=20")
+if orders:
+    st.dataframe([{
+        "submitted": o["submitted_at"][:19],
+        "class": o.get("order_class") or "single",
+        "legs": len(o.get("legs") or []) or 1,
+        "symbol": o.get("symbol") or "(mleg)",
+        "side": o.get("side") or "-",
+        "qty": o.get("qty"),
+        "limit": o.get("limit_price"),
+        "status": o["status"],
+    } for o in orders], use_container_width=True)
+else:
+    st.info("No orders yet.")
+
+st.subheader("Close-rule checks (R1–R4, pre-registered)")
+close_rows = _jsonl(_ROOT / "ledger" / "close_log.jsonl")
+if close_rows:
+    st.dataframe([{k: r.get(k) for k in
+                   ("ts", "underlying", "action", "rule", "dte",
+                    "entry", "value", "kind", "why")}
+                  for r in close_rows[-30:]], use_container_width=True)
+else:
+    st.info("Close log not present in this deployment "
+            "(the agent writes ledger/close_log.jsonl at runtime).")
+
+st.subheader("Decision ledger (gates · red-team · orders · shadow twin)")
+rows = _jsonl(_ROOT / "ledger" / "decisions.jsonl")
+if rows:
+    st.dataframe([{k: json.dumps(r.get(k), ensure_ascii=False, default=str)
+                   if isinstance(r.get(k), (dict, list)) else r.get(k)
+                   for k in ("ts", "book", "kind", "symbol", "allowed",
+                             "max_loss", "status")}
+                  for r in rows[-40:]], use_container_width=True)
+else:
+    st.info("Decision ledger not present in this deployment "
+            "(the agent writes ledger/decisions.jsonl at runtime).")

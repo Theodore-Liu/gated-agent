@@ -32,6 +32,40 @@ Dual Alpaca tech, split by power: the **CLI** owns the deterministic order
 path, the **MCP server** feeds the veto-only LLM red-teamer. Neither side can
 do the other's job.
 
+```mermaid
+flowchart TD
+    RUN["python -m gated_agent.run<br/>(daily · idempotent per day)"]
+    RUN --> EXITS["position_manager.py — runs BEFORE any new open<br/>frozen close rules R1–R4 (config/close_rules.json):<br/>R1 DTE≤2 · R2/R3 TP/SL ±50% · R4 flip-close · quote-gap force-close"]
+    RUN --> SIG["signals.py<br/>toy: Faber 10-mo SMA (SPY/QQQ/IWM)<br/>{symbol, direction, strength, spot}"]
+    RUN --> NEG["negctl.py<br/>seeded RANDOM signal<br/>same contract shape"]
+
+    SIG --> CHAIN["chain_fetcher.py<br/>Alpaca contracts + snapshots (quotes + greeks)<br/>no keys → labeled synthetic chain"]
+    NEG --> CHAIN
+
+    CHAIN --> MAP["options_mapper.py<br/>deterministic signal → defined-risk legs<br/>Δ0.50 buy / Δ0.25 sell · moneyness fallback<br/>debit spreads (strong) · narrow credit spreads (mild)"]
+
+    MAP --> GATES["gates.py — arithmetic, cannot be talked out of<br/>① worst-case loss ≤ 5% equity<br/>② daily loss halt −2%<br/>③ idempotent dedup<br/>④ direction-flip guard (no hedged books)"]
+
+    GATES --> RT["redteam_mcp.py — LLM via Alpaca MCP · VETO-ONLY<br/>McpRedTeam when ANTHROPIC_API_KEY set, identical-protocol stub otherwise<br/>1 max-loss scenario? 2 greeks exposure? 3 liquidity exit?<br/>redteam.v1 JSON → approve | veto"]
+
+    RT -->|live book| CLI["order_cli.py + cli_executor.py<br/>official Alpaca CLI · one atomic mleg per spread<br/>net limit: negative = credit<br/>--dry-run default · live needs ALPACA_HACKATHON_LIVE=1"]
+    RT -->|shadow book| STOP["STOP — shadow never reaches the order path<br/>logged as would-trade only"]
+
+    EXITS -->|"unwinds: same mleg path, *_to_close intents"| CLI
+    EXITS -.->|"position_closed record admits the reverse entry"| GATES
+
+    CLI --> LED["ledger.py — append-only JSONL<br/>every decision · both books side by side"]
+    STOP --> LED
+
+    style EXITS fill:#4a3200,color:#fff
+    style GATES fill:#8b0000,color:#fff
+    style RT fill:#1a3a5c,color:#fff
+    style STOP fill:#333,color:#fff
+```
+
+<details>
+<summary>ASCII version (terminal readers)</summary>
+
 ```
                 ┌──────────────────────────────────────────────────────┐
                 │                 python -m gated_agent.run            │
@@ -93,14 +127,23 @@ do the other's job.
                   │  side by side                   │
                   └─────────────────────────────────┘
 
-* red-team LLM+MCP is the one remaining stub — see "What's stubbed" below.
+* red-team: MCP-backed LLM when ANTHROPIC_API_KEY is set; identical-protocol
+  deterministic stub otherwise — see "What's stubbed" below.
 ```
 
-**Exit rules are config, not signals.** Positions are closed by pre-registered
-deterministic rules — close N days before expiry, take-profit / stop-loss
-lines — with parameters frozen in config before the run, never improvised
-intraday. The signal only ever opens; a direction flip must wait until the
-exit rules have closed the conflicting position (gate 4 enforces this).
+</details>
+
+**Exit rules are config, not signals.** Positions are closed by the
+pre-registered rules R1–R4 in `position_manager.py` — R1 close at DTE ≤ 2,
+R2 take profit (debit +50% / credit keep 50%), R3 stop loss (debit −50% /
+credit lose 1× premium), R4 close-before-flip — with parameters **frozen in
+[`config/close_rules.json`](config/close_rules.json)** before the run, never
+improvised intraday. The daily run evaluates closes **before** any new open,
+through the same atomic mleg CLI path (`*_to_close` intents). The signal only
+ever opens; a direction flip must wait until R4's close is confirmed as a
+`position_closed` ledger record (gate 4 reads exactly that). A structure whose
+quotes gap 3 rounds in a row is force-closed at market — never hold a position
+we can't see.
 
 ## Signal contract (the isolation interface)
 
@@ -144,8 +187,26 @@ morning scheduled task (`GatedAgentDaily`, hidden window, logs to
 | Risk gates (5% cap, -2% halt, dedup, flip guard) | **real, tested** |
 | Option chain + equity (`chain_fetcher.py`) | **real code, tested offline** — needs keys in `.env`; without keys: labeled synthetic chain |
 | Order submission (`cli_executor.py`, atomic mleg, credit sign verified) | **real code, live dry-run verified 2026-08-24** — needs keys for the account leg |
-| Red-team veto protocol (`redteam.v1` JSON) | **real contract**; answers come from a deterministic stub — swaps to LLM + Alpaca MCP |
-| Fills / realized PnL / exit-rule execution | not yet — halt gate and flip guard run off the ledger stub, exercised by tests |
+| Red-team veto protocol (`redteam.v1` JSON) | **real** — `McpRedTeam` (claude CLI + Alpaca MCP, read-only allowlist, fail-closed) when `ANTHROPIC_API_KEY` is in `.env`; identical-protocol deterministic stub otherwise |
+| Close rules R1–R4 (`position_manager.py`, frozen `config/close_rules.json`) | **real, tested** — runs before opens each day; live position fetch needs keys |
+| Fills / realized PnL | not yet — halt gate runs off the ledger stub, exercised by tests |
+
+## Dashboard (demo URL)
+
+`src/gated_agent/dashboard.py` is a **read-only** Streamlit page: equity,
+open positions, recent orders, close-rule checks, and the decision ledger.
+No order controls exist on the page.
+
+Deploy on [Streamlit Community Cloud](https://share.streamlit.io):
+
+1. Point the app at this repo, **main file path** `src/gated_agent/dashboard.py`.
+2. Add secrets `ALPACA_API_KEY` / `ALPACA_SECRET_KEY` (paper account).
+3. Local check: `pip install -e ".[dashboard]"` then
+   `streamlit run src/gated_agent/dashboard.py`.
+
+The ledger tables render only when the deployment has the runtime
+`ledger/*.jsonl` files (e.g. running on the agent box); the cloud deploy
+shows account state regardless.
 
 ## Honesty notes
 
@@ -153,11 +214,13 @@ morning scheduled task (`GatedAgentDaily`, hidden window, logs to
   from Mebane Faber's *A Quantitative Approach to Tactical Asset Allocation*,
   approximated as a 210-trading-day SMA. It is a toy on purpose.
 - No keys anywhere in the repo. `.env.example` only; `.env*` is gitignored.
-- `src/gated_agent/options_mapper.py`, `chain_fetcher.py`, `cli_executor.py`
-  and the mapper tests were written clean-room for this hackathon (orchestra's
-  staging modules, live-data validated 2026-08-24) and are integrated with
-  minimal edits: package imports, a CLI path resolver, and `fetch_equity()` —
-  each marked in-file.
+- `src/gated_agent/options_mapper.py`, `chain_fetcher.py`, `cli_executor.py`,
+  `position_manager.py`, `dashboard.py`, the `McpRedTeam` client and the
+  mapper/close-rule tests were written clean-room for this hackathon
+  (orchestra's staging modules, live-data validated 2026-08-24) and are
+  integrated with minimal edits: package imports, a CLI path resolver,
+  `fetch_equity()`, config-file loading for the frozen close rules, and
+  ledger `position_closed` coordination — each marked in-file.
 
 ## License
 

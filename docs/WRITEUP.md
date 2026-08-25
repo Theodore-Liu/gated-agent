@@ -17,15 +17,22 @@ Every order passes all gates; any veto kills it; anything unpriceable fails clos
 3. **Position cap** — worst-case loss of the order ≤ 5% of equity (independent re-check).
 4. **Daily loss halt** — realized PnL ≤ −2% of equity stops all new orders for the day.
 5. **Idempotent dedup** — the same (day, symbol, legs) order is never sent twice, keyed off an append-only JSONL decision ledger.
-6. **Direction-flip guard** — while a position is open in a symbol, a reverse open is refused until pre-registered exit rules (close N days before expiry, take-profit / stop-loss lines — parameters frozen in config before the run, not improvised) have closed it. Hedged long+short books are banned outright.
+6. **Direction-flip guard** — while a position is open in a symbol, a reverse open is refused until the pre-registered close rules below have closed it (a confirmed close writes a `position_closed` ledger record; the guard reads exactly that). Hedged long+short books are banned outright.
+7. **Pre-registered close rules R1–R4** — every open structure is re-evaluated **before any new open**, with parameters **frozen in `config/close_rules.json` dated 2026-08-24, before the contest window** — not improvised mid-run:
+   - **R1 time gate** — DTE ≤ 2 → close unconditionally (avoid pin/assignment week).
+   - **R2 take profit** — debit: value ≥ 1.5× entry (+50%); credit: buy back at ≤ 0.5× the premium received (keep 50%).
+   - **R3 stop loss** — debit: value ≤ 0.5× entry (−50%); credit: buy back at ≥ 2.0× the premium received (lose 1× premium).
+   - **R4 signal flip** — a reverse signal closes the old structure *first*; only after that close confirms does the flip guard admit the new direction. Same-day ordering is built into the daily run: close checks precede opens.
 
-Every decision — signal, mapping, gate verdicts, red-team protocol JSON, order intent, shadow twin — is one appended line in the ledger: a complete, replayable audit trail.
+   Valuation is snapshot mid, the same source as at entry. A leg with no quote skips its structure that round; after 3 consecutive gapped rounds the structure is force-closed at market — *never hold a position we can't see*. Checks run twice per session (open+30min, close−45min), and unwinds go through the **same atomic mleg CLI path** as entries, with explicit `*_to_close` intents and the credit/debit sign preserved.
+
+Every decision — signal, mapping, gate verdicts, red-team protocol JSON, order intent, close-rule verdicts, shadow twin — is one appended line in the ledger: a complete, replayable audit trail.
 
 ## Alpaca infrastructure
 
 - **Data:** `/v2/options/contracts` + `/v1beta1/options/snapshots` (indicative feed) give strikes, quotes, and greeks in one merged chain; equity from `/v2/account`. All read-only.
 - **Orders:** the official Alpaca CLI — built for agent/cron sessions — submits each spread as **one atomic multi-leg order** (`--order-class mleg`, net limit price, negative = credit; sign preserved, a bug we caught live). Default mode is the CLI's own `--dry-run`; real submission requires both a `--live` flag and `ALPACA_HACKATHON_LIVE=1`, two independent switches.
-- **MCP:** the red-team LLM reads account and market context through Alpaca's MCP server — it observes everything and touches nothing.
+- **MCP:** the red-team LLM reads account and market context through Alpaca's MCP server behind a client-side read-only tool allowlist (every `place_*`/`cancel_*` call is denied by the harness) — it observes everything and touches nothing. With `ANTHROPIC_API_KEY` in `.env` the MCP-backed red-teamer runs; without it a deterministic stub answers the same three questions in the same protocol, so tests and keyless clones stay offline. Fail-closed either way: any error or garbage output is a veto.
 - **Environment:** Alpaca paper account; a Windows scheduled task runs the agent each weekday morning; keys live only in `.env` (gitignored), and with no keys the whole system still runs offline on a labeled synthetic chain.
 
 *Toy signal, real discipline. The gates, the veto loop, the negative control, and the audit log are the product.*
