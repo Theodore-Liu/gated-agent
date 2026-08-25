@@ -65,12 +65,15 @@ def _net_limit(legs: list) -> float:
 def _cli_legs(legs: list) -> str:
     out = []
     for leg in legs:
+        # Opening legs default to *_to_open; position_manager sets explicit
+        # *_to_close intents on its unwind legs (re-synced from staging).
+        intent = leg.get("position_intent") or (
+            "buy_to_open" if leg["side"] == "buy" else "sell_to_open")
         out.append({
             "symbol": leg["occ_symbol"],
             "ratio_qty": "1",
             "side": leg["side"],
-            "position_intent": ("buy_to_open" if leg["side"] == "buy"
-                                 else "sell_to_open"),
+            "position_intent": intent,
         })
     return json.dumps(out)
 

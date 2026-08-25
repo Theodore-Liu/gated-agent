@@ -41,6 +41,21 @@ def test_cli_legs_position_intents():
     assert all(l["ratio_qty"] == "1" for l in legs)
 
 
+def test_cli_legs_explicit_close_intents_survive():
+    # position_manager's unwind legs carry *_to_close; the executor must
+    # forward them instead of defaulting to *_to_open (staging re-sync).
+    closing = [dict(DEBIT[0], side="sell", position_intent="sell_to_close"),
+               dict(DEBIT[1], side="buy", position_intent="buy_to_close")]
+    legs = json.loads(_cli_legs(closing))
+    assert legs[0]["position_intent"] == "sell_to_close"
+    assert legs[1]["position_intent"] == "buy_to_close"
+
+
+def test_cli_legs_empty_intent_falls_back_to_open():
+    legs = json.loads(_cli_legs([dict(DEBIT[0], position_intent=None)]))
+    assert legs[0]["position_intent"] == "buy_to_open"
+
+
 def test_preview_mleg_carries_negative_credit_limit():
     cmd = build_command_preview(CREDIT)
     assert "--order-class mleg" in cmd

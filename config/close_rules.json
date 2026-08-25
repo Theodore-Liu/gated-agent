@@ -1,0 +1,13 @@
+{
+  "_comment": "Pre-registered closing rules R1-R4 - FROZEN 2026-08-24 (orchestra bus message '平仓规则定稿 v1') BEFORE the contest window. Judges: parameters were fixed before any live run; changing them mid-contest would show in git history.",
+  "frozen_on": "2026-08-24",
+  "dte_close": 2,
+  "tp_debit_mult": 1.5,
+  "tp_credit_mult": 0.5,
+  "sl_debit_mult": 0.5,
+  "sl_credit_mult": 2.0,
+  "flip_close": true,
+  "valuation": "snapshot_mid",
+  "max_quote_gaps": 3,
+  "check_times": ["open+30min", "close-45min"]
+}
