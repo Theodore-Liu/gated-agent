@@ -116,3 +116,26 @@ def test_occ_symbol_and_cli_command():
     assert cmds == [["alpaca", "orders", "create", "--symbol", sym,
                      "--side", "buy", "--qty", "2", "--type", "limit",
                      "--limit-price", "5.25", "--time-in-force", "day"]]
+
+
+def test_order_intent_carries_broker_receipt(tmp_path):
+    """08-25 live-test finding: the order id lived only in Alpaca — the ledger
+    row must carry the broker receipt so every decision closes the loop."""
+    from gated_agent.cli_executor import ExecResult
+    from gated_agent.order_cli import AlpacaCLIBroker
+
+    def fake_executor(legs, dry_run=True, **kw):
+        return ExecResult(True, False, {"id": "abc-123", "status": "accepted",
+                                        "legs": []}, "{}")
+
+    broker = AlpacaCLIBroker(dry_run=False, executor=fake_executor)
+    broker.get_option_chain = StubCLIBroker(dry_run=True).get_option_chain
+    broker.get_equity = lambda: 100_000.0
+    ledger, rt = Ledger(tmp_path / "l.jsonl"), StubRedTeam()
+    result = process("SPY", dict(STRONG_LONG), "live", broker=broker,
+                     ledger=ledger, redteam=rt, run_date=RUN_DATE, today=TODAY)
+    assert result is not None and result["status"] == "submitted"
+    intents = [r for r in ledger.day(RUN_DATE, "live")
+               if r["kind"] == "order_intent"]
+    assert intents[0]["broker_receipt"] == {"id": "abc-123",
+                                            "status": "accepted"}

@@ -84,11 +84,20 @@ def process(symbol: str, signal: dict, book: str, *, broker: Broker,
         return None
 
     result = broker.submit_order(symbol, legs, key)
+    # Broker receipt into the ledger (08-25 live test finding: order_intent
+    # rows carried only the command preview — the actual order id / status
+    # lived nowhere, breaking "every decision traceable" at the last hop).
+    req = result.get("request") or {}
+    receipt = {k: req.get(k) for k in ("id", "status", "filled_at",
+                                       "filled_avg_price")
+               if isinstance(req, dict) and req.get(k) is not None}
     ledger.append(run_date, book, "order_intent", symbol=symbol, legs=legs,
                   max_loss=max_loss, dedup_key=key, status=result["status"],
                   direction=signal["direction"],
-                  cli_commands=result["cli_commands"])
-    print(f"  [{book}] {symbol}: ORDER INTENT ({result['status']}) — "
+                  cli_commands=result["cli_commands"],
+                  broker_receipt=receipt or None)
+    oid = f" order {receipt['id'][:8]}" if receipt.get("id") else ""
+    print(f"  [{book}] {symbol}: ORDER INTENT ({result['status']}{oid}) — "
           f"max loss ${max_loss:,.0f}")
     for cmd in result["cli_commands"]:
         print("      $ " + (cmd if isinstance(cmd, str) else " ".join(cmd)))
