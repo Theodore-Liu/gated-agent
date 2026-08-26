@@ -159,7 +159,16 @@ class Ledger:
             **payload,
         }
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        line = json.dumps(rec, ensure_ascii=False, sort_keys=True) + "\n"
+        # `default=str` is a safety property, not a convenience. Every payload
+        # here is assembled by a caller, and option code passes `date` objects
+        # around constantly (parse_occ returns one). Without this, ONE such
+        # value anywhere in a payload raises inside the write and takes down
+        # the only record of dedup, the once-per-day guard, the flip guard and
+        # the daily-loss halt. A slightly lossy value beats a lost line.
+        # (Hit for real on 2026-08-26: a mis-shaped reconcile payload aborted
+        # the write half way through the record set.)
+        line = json.dumps(rec, ensure_ascii=False, sort_keys=True,
+                          default=str) + "\n"
         # Retry a locked ledger (dashboard/editor holding the file on Windows)
         # before giving up: losing this write costs traceability AND dedup.
         for attempt in range(_LOCK_RETRIES):

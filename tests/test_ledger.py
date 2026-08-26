@@ -61,3 +61,23 @@ def test_realized_pnl_sums_fills(tmp_path):
     led.append("2026-08-24", "live", "fill", pnl=250.0)
     led.append("2026-08-24", "shadow", "fill", pnl=-9999.0)  # shadow ignored
     assert led.realized_pnl("2026-08-24") == -1250.0
+
+
+def test_append_never_dies_on_an_exotic_payload_value(tmp_path):
+    """The ledger is the sole record of dedup, the once-per-day guard, the
+    flip guard and the daily-loss halt. A payload carrying a `date` (option
+    code passes them everywhere — parse_occ returns one) used to raise inside
+    json.dumps and abort the write, so a mis-shaped call took all four safety
+    properties down together. Hit for real on 2026-08-26."""
+    from datetime import date as _date
+    from decimal import Decimal
+
+    led = Ledger(tmp_path / "l.jsonl")
+    led.append("2026-08-26", "live", "position_adopted", symbol="SPY",
+               expiry=_date(2026, 9, 4), size=Decimal("2.5"),
+               legs=[{"occ_symbol": "SPY260904C00640000",
+                      "expiry": _date(2026, 9, 4)}])
+    rows = led.records()
+    assert len(rows) == 1
+    assert rows[0]["expiry"] == "2026-09-04"      # stringified, not lost
+    assert rows[0]["legs"][0]["expiry"] == "2026-09-04"   # nested too
