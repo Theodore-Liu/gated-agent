@@ -25,10 +25,22 @@ _ROOT = Path(__file__).resolve().parents[2]           # src/gated_agent -> repo
 st.set_page_config(page_title="Gated Agent — Live State", layout="wide")
 
 
+def _secret(name: str) -> str:
+    # Touching st.secrets raises when no secrets.toml exists (it does not fall
+    # back like dict.get), which turned the env-var path into dead code and
+    # made every non-Cloud run report "Account API unreachable".
+    try:
+        value = st.secrets.get(name)
+    except Exception:  # noqa: BLE001 -- any secrets-backend failure -> env
+        value = None
+    return value or os.environ.get(name, "")
+
+
 def _headers() -> dict:
-    key = st.secrets.get("ALPACA_API_KEY", os.environ.get("ALPACA_API_KEY", ""))
-    sec = st.secrets.get("ALPACA_SECRET_KEY", os.environ.get("ALPACA_SECRET_KEY", ""))
-    return {"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": sec}
+    return {
+        "APCA-API-KEY-ID": _secret("ALPACA_API_KEY"),
+        "APCA-API-SECRET-KEY": _secret("ALPACA_SECRET_KEY"),
+    }
 
 
 @st.cache_data(ttl=60)
@@ -71,7 +83,7 @@ if positions:
         "avg entry": p["avg_entry_price"],
         "market value": f"${float(p['market_value']):,.0f}",
         "unrealized P&L": f"${float(p['unrealized_pl']):,.2f}",
-    } for p in positions], use_container_width=True)
+    } for p in positions], width="stretch")
 else:
     st.info("No open positions.")
 
@@ -87,7 +99,7 @@ if orders:
         "qty": o.get("qty"),
         "limit": o.get("limit_price"),
         "status": o["status"],
-    } for o in orders], use_container_width=True)
+    } for o in orders], width="stretch")
 else:
     st.info("No orders yet.")
 
@@ -97,7 +109,7 @@ if close_rows:
     st.dataframe([{k: r.get(k) for k in
                    ("ts", "underlying", "action", "rule", "dte",
                     "entry", "value", "kind", "why")}
-                  for r in close_rows[-30:]], use_container_width=True)
+                  for r in close_rows[-30:]], width="stretch")
 else:
     st.info("Close log not present in this deployment "
             "(the agent writes ledger/close_log.jsonl at runtime).")
@@ -109,7 +121,7 @@ if rows:
                    if isinstance(r.get(k), (dict, list)) else r.get(k)
                    for k in ("ts", "book", "kind", "symbol", "allowed",
                              "max_loss", "status")}
-                  for r in rows[-40:]], use_container_width=True)
+                  for r in rows[-40:]], width="stretch")
 else:
     st.info("Decision ledger not present in this deployment "
             "(the agent writes ledger/decisions.jsonl at runtime).")
