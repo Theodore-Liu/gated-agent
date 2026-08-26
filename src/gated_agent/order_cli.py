@@ -67,6 +67,10 @@ class Broker(ABC):
     @abstractmethod
     def submit_order(self, symbol: str, legs: list[dict], dedup_key: str) -> dict: ...
 
+    def get_clock(self) -> dict | None:
+        """Broker market clock, or None when this adapter has no opinion."""
+        return None
+
 
 class StubCLIBroker(Broker):
     """Stand-in until the Alpaca paper account exists.
@@ -146,6 +150,12 @@ class AlpacaCLIBroker(Broker):
 
     def get_equity(self) -> float:
         return chain_fetcher.fetch_equity()
+
+    def get_account(self) -> dict:
+        return chain_fetcher.fetch_account()
+
+    def get_clock(self) -> dict | None:
+        return chain_fetcher.fetch_clock()
 
     def get_option_chain(self, symbol: str, spot: float, today: date) -> list[dict]:
         # spot is unused: the chain window is DTE-based; quotes come live.

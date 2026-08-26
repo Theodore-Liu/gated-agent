@@ -58,7 +58,7 @@ def _net_limit(legs: list) -> float:
     net = 0.0
     for leg in legs:
         sign = 1 if leg["side"] == "buy" else -1
-        net += sign * float(leg["limit"])
+        net += sign * float(leg["limit"] or 0.0)
     return round(net, 2)
 
 
@@ -78,31 +78,63 @@ def _cli_legs(legs: list) -> str:
     return json.dumps(out)
 
 
+def _check_priceable(legs: list) -> None:
+    """A limit order needs a price for every leg.
+
+    `position_manager.close_legs` used to floor a missing mid to 0.0, which on
+    a limit close is an instruction to accept any price at all — the exact
+    opposite of what the caller meant. A leg we cannot price does not get a
+    made-up one; it gets refused, and the caller either waits for a quote or
+    asks for an explicit market order.
+    """
+    for leg in legs:
+        px = leg.get("limit")
+        if px is None or float(px) <= 0:
+            raise ValueError(
+                f"leg {leg['occ_symbol']} has no usable limit price ({px!r}); "
+                f"refusing to submit a limit order priced at zero — pass "
+                f"order_type='market' if that is really what you want")
+
+
 def submit_legs(legs: list, *, dry_run: bool = True,
-                time_in_force: str = "day", env: dict | None = None) -> ExecResult:
-    """Submit mapper output as one order (mleg for spreads, plain for 1 leg)."""
+                time_in_force: str = "day", order_type: str = "limit",
+                env: dict | None = None) -> ExecResult:
+    """Submit mapper output as one order (mleg for spreads, plain for 1 leg).
+
+    `order_type="market"` is the quote-gap force-close path: `evaluate()`
+    decides a blind position must go at market, and that decision has to
+    survive all the way to the argv. It used to be computed and thrown away,
+    so the "never hold a position we cannot see" rule submitted a LIMIT order
+    priced off the very quotes that were missing.
+    """
     if not legs:
         return ExecResult(True, dry_run, None, "stand aside: no legs")
     if len(legs) > 4:
         raise ValueError("mleg supports at most 4 legs")
+    if order_type not in ("limit", "market"):
+        raise ValueError(f"unsupported order type {order_type!r}")
     qtys = {leg["qty"] for leg in legs}
     if len(qtys) != 1:
         raise ValueError("all legs must share the same qty (ratio_qty=1 model)")
     qty = qtys.pop()
+    if order_type == "limit":
+        _check_priceable(legs)
 
     if not dry_run and os.environ.get("ALPACA_HACKATHON_LIVE") != "1":
         raise RuntimeError("refusing live order: ALPACA_HACKATHON_LIVE != 1")
 
+    price = ([] if order_type == "market" else
+             ["--limit-price", f"{float(legs[0]['limit']):.2f}"
+              if len(legs) == 1 else f"{_net_limit(legs):.2f}"])
     if len(legs) == 1:
         leg = legs[0]
         args = ["order", "submit", "--symbol", leg["occ_symbol"],
                 "--side", leg["side"], "--qty", str(qty),
-                "--type", "limit", "--limit-price", f"{float(leg['limit']):.2f}",
+                "--type", order_type, *price,
                 "--time-in-force", time_in_force]
     else:
         args = ["order", "submit", "--order-class", "mleg",
-                "--qty", str(qty), "--type", "limit",
-                "--limit-price", f"{_net_limit(legs):.2f}",
+                "--qty", str(qty), "--type", order_type, *price,
                 "--time-in-force", time_in_force,
                 "--legs", _cli_legs(legs)]
     if dry_run:
@@ -120,17 +152,22 @@ def submit_legs(legs: list, *, dry_run: bool = True,
     return ExecResult(r.returncode == 0, dry_run, req, raw)
 
 
-def build_command_preview(legs: list) -> str:
+def build_command_preview(legs: list, order_type: str = "limit") -> str:
     """For logs/UI: the exact CLI call that would run (dry-run form)."""
     res = []
+    if order_type == "market":
+        price: list = []
+    elif len(legs) == 1:
+        price = ["--limit-price", f"{float(legs[0]['limit'] or 0):.2f}"]
+    else:
+        price = ["--limit-price", f"{_net_limit(legs):.2f}"]
     if len(legs) == 1:
         leg = legs[0]
         res = ["alpaca", "order", "submit", "--symbol", leg["occ_symbol"],
                "--side", leg["side"], "--qty", str(leg["qty"]),
-               "--type", "limit", "--limit-price", f"{float(leg['limit']):.2f}"]
+               "--type", order_type, *price]
     elif legs:
         res = ["alpaca", "order", "submit", "--order-class", "mleg",
-               "--qty", str(legs[0]["qty"]), "--type", "limit",
-               "--limit-price", f"{_net_limit(legs):.2f}",
+               "--qty", str(legs[0]["qty"]), "--type", order_type, *price,
                "--legs", _cli_legs(legs)]
     return " ".join(res)

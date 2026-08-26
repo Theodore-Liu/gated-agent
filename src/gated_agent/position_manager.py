@@ -37,7 +37,7 @@ import os
 import re
 import urllib.parse
 import urllib.request
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 from .chain_fetcher import DATA, TRADING, _headers
@@ -104,15 +104,122 @@ def _get(url: str) -> dict | list:
         return json.loads(r.read())
 
 
-def fetch_option_positions() -> list:
+def fetch_all_positions() -> list:
+    return list(_get(f"{TRADING}/v2/positions"))
+
+
+def fetch_option_positions(raw: list | None = None) -> list:
     """Open option positions -> [{occ_symbol, qty(signed int), entry(float)}]."""
     out = []
-    for p in _get(f"{TRADING}/v2/positions"):
+    for p in (fetch_all_positions() if raw is None else raw):
         if p.get("asset_class") != "us_option":
             continue
         out.append({"occ_symbol": p["symbol"], "qty": int(float(p["qty"])),
                     "entry": float(p["avg_entry_price"])})
     return out
+
+
+def detect_non_option_positions(raw: list, *, ledger=None,
+                                run_date: str | None = None) -> list:
+    """Shout about anything in the account that is not an option.
+
+    Early assignment on the short leg of a credit spread leaves 100 shares per
+    contract sitting in the account. Every rule this agent has looks only at
+    `asset_class == "us_option"`, so that stock is invisible to R1-R4, to the
+    flip guard and to the position-size gate — forever — while the orphaned
+    long leg gets re-evaluated as if it were a fresh structure. Liquidating it
+    automatically is a bigger decision than a review should take unilaterally;
+    making it impossible to MISS is not.
+    """
+    alerts = []
+    for p in raw or []:
+        if p.get("asset_class") == "us_option":
+            continue
+        try:
+            qty = float(p.get("qty") or 0)
+        except (TypeError, ValueError):
+            qty = 0.0
+        alert = {"symbol": p.get("symbol"), "asset_class": p.get("asset_class"),
+                 "qty": qty, "avg_entry_price": p.get("avg_entry_price")}
+        alerts.append(alert)
+        if ledger is not None:
+            ledger.append(run_date or date.today().isoformat(), "live",
+                          "assignment_suspected", **alert,
+                          why="non-option position in the account: early "
+                              "assignment or manual intervention. No exit rule "
+                              "in this agent can see or manage it.")
+    return alerts
+
+
+def structure_direction(legs: list) -> str | None:
+    """Directional sense of a position, from strikes and signs alone.
+
+    Reconciliation has to be able to name the direction of a structure it did
+    not open (a fill that outlived its ledger row, a manual trade, a rehearsal
+    that turned real). Purely arithmetic — no ledger, no signal.
+
+        long  = bull call debit, bull put credit, long call, short put
+        short = bear call credit, bear put debit, long put, short call
+    """
+    legs = [l for l in legs if l.get("qty")]
+    if not legs:
+        return None
+    if len(legs) == 1:
+        (leg,) = legs
+        bullish = (leg["type"] == "call") == (leg["qty"] > 0)
+        return "long" if bullish else "short"
+    longs = [l for l in legs if l["qty"] > 0]
+    shorts = [l for l in legs if l["qty"] < 0]
+    if len(longs) != 1 or len(shorts) != 1:
+        return None
+    (lo,), (sh,) = longs, shorts
+    if lo["type"] != sh["type"]:
+        return None
+    if lo["type"] == "call":
+        return "long" if lo["strike"] < sh["strike"] else "short"
+    return "short" if lo["strike"] > sh["strike"] else "long"
+
+
+def reconcile(ledger, run_date: str, actual: dict) -> list:
+    """Re-sync the ledger's BELIEVED book to the broker's ACTUAL positions.
+
+    The flip guard, and therefore the ban on hedged books, is only as good as
+    the ledger's picture of what is open. That picture is built from order
+    *intents*, and intents drift from reality in both directions:
+
+      * believed open, actually flat — an order that was accepted and never
+        filled (the 08-25 IWM order expired unfilled), a position that expired
+        worthless, one that was assigned away, or a `--dry-run` rehearsal.
+        Nothing ever writes `position_closed` for a position the broker does
+        not have, so the symbol stays frozen in one direction for the whole
+        competition and no log line says why.
+      * believed flat, actually open — a dry-run close that wrote
+        `position_closed` for an unwind that never happened, or manual
+        intervention. Opening the reverse here builds exactly the hedged book
+        gate 4 exists to ban.
+
+    `actual` maps underlying -> direction (from structure_direction). Runs at
+    the start of every round, before any exit rule and long before any open.
+    """
+    records = []
+    believed = ledger.open_positions(book="live")
+    for symbol, direction in sorted(believed.items()):
+        if symbol not in actual:
+            records.append(ledger.append(
+                run_date, "live", "position_reconciled", symbol=symbol,
+                was=direction, why="ledger believed this position was open; "
+                                   "the broker has no option position in it "
+                                   "(unfilled, expired, assigned, or a "
+                                   "dry-run rehearsal)"))
+    for symbol, direction in sorted(actual.items()):
+        if believed.get(symbol) != direction:
+            records.append(ledger.append(
+                run_date, "live", "position_adopted", symbol=symbol,
+                direction=direction, believed=believed.get(symbol),
+                why="the broker holds this structure; the ledger did not "
+                    "believe it was open (or had it in the other direction). "
+                    "The account is the source of truth."))
+    return records
 
 
 def fetch_mids(symbols: list) -> dict:
@@ -198,16 +305,44 @@ def evaluate(legs: list, mids: dict, today: date,
 
 def close_legs(legs: list, mids: dict) -> list:
     """Reverse every leg with explicit *_to_close intents, priced at mid.
-    cli_executor._net_limit keeps the sign (credit close = negative limit)."""
+    cli_executor._net_limit keeps the sign (credit close = negative limit).
+
+    A leg with no mid gets `limit: None`, NOT 0.0. Flooring to zero used to
+    turn "we cannot see this leg" into "accept any price for it" on a limit
+    order; cli_executor now refuses such a leg outright, and the only path
+    that legitimately has no price is the quote-gap force-close, which goes
+    out as an explicit market order.
+    """
     out = []
     for leg in legs:
         long = leg["qty"] > 0
+        mid = mids.get(leg["occ_symbol"])
         out.append({"occ_symbol": leg["occ_symbol"],
                     "side": "sell" if long else "buy",
                     "position_intent": "sell_to_close" if long else "buy_to_close",
                     "qty": abs(leg["qty"]),
-                    "limit": mids.get(leg["occ_symbol"]) or 0.0})
+                    "limit": mid if (mid or 0) > 0 else None})
     return out
+
+
+def structure_pnl(legs: list, entry: float | None, value: float | None
+                  ) -> float | None:
+    """Realized dollars on a closed structure: (V - E) x 100 x contracts.
+
+    The -2% daily halt summed ledger records of kind "fill" — and nothing in
+    this project has ever written a "fill". The halt was inert. This is the
+    number that makes it real.
+    """
+    if entry is None or value is None or not legs:
+        return None
+    units = min(abs(int(l["qty"])) for l in legs)
+    return round((value - entry) * 100 * units, 2)
+
+
+def live_switch_armed() -> bool:
+    """Is the second live switch set? Read at CALL time, never at import —
+    .env is parsed after this module loads (the 08-25 CLAUDE_BIN family)."""
+    return os.environ.get("ALPACA_HACKATHON_LIVE") == "1"
 
 
 def _load_state() -> dict:
@@ -221,47 +356,84 @@ def _load_state() -> dict:
 def check_positions(flips: dict | None = None, *, dry_run: bool = True,
                     today: date | None = None, positions: list | None = None,
                     mids: dict | None = None, executor=None,
-                    ledger=None, run_date: str | None = None) -> list:
+                    ledger=None, run_date: str | None = None,
+                    raw_positions: list | None = None) -> list:
     """One monitoring round over every open structure. Returns action records.
 
     `positions` / `mids` / `executor` are injectable for tests (default: live
-    Alpaca fetch + the real mleg CLI path). When a `ledger` is given, every
-    executed close also appends a `position_closed` record -- the exact record
-    the direction-flip gate reads, closing the R4 loop with gates.py.
+    Alpaca fetch + the real mleg CLI path). When a `ledger` is given, the round
+    also (a) reconciles the ledger's believed book against these positions
+    before evaluating anything, and (b) appends a `position_closed` record for
+    every executed close -- the exact record the direction-flip gate reads,
+    closing the R4 loop with gates.py.
+
+    Every structure is isolated. Before, one raising submit aborted the round
+    for every OTHER underlying and skipped the state and close-log writes at
+    the end, so the quote-gap counters silently never advanced and the
+    judge-facing close log had no row for a round that definitely happened.
     """
     today = today or date.today()
     flips = flips or {}
     submit = executor or submit_legs
     state = _load_state()
     if positions is None:
-        positions = fetch_option_positions()
+        raw_positions = fetch_all_positions() if raw_positions is None else raw_positions
+        positions = fetch_option_positions(raw_positions)
     groups = group_structures(positions)
     all_syms = [l["occ_symbol"] for legs in groups.values() for l in legs]
     if mids is None:
         mids = fetch_mids(all_syms) if all_syms else {}
 
+    if ledger is not None:
+        if raw_positions is not None:
+            detect_non_option_positions(raw_positions, ledger=ledger,
+                                        run_date=run_date)
+        actual = {und: d for und, legs in groups.items()
+                  if (d := structure_direction(legs))}
+        reconcile(ledger, run_date or today.isoformat(), actual)
+
     records = []
     for und, legs in sorted(groups.items()):
         gaps = int(state.get(und, {}).get("quote_gaps", 0))
-        verdict = evaluate(legs, mids, today,
-                           flip=und in flips, quote_gaps=gaps)
-        rec = {"ts": datetime.now().isoformat(timespec="seconds"),
-               "underlying": und, **verdict}
-        if verdict["action"] == "close":
-            unwind = close_legs(legs, mids)
-            res = submit(unwind, dry_run=dry_run)
-            rec.update(legs=unwind, exec_ok=res.ok, dry_run=res.dry_run)
-            if res.ok and ledger is not None:
+        rec = {"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+               "underlying": und}
+        try:
+            verdict = evaluate(legs, mids, today,
+                               flip=und in flips, quote_gaps=gaps)
+            rec.update(verdict)
+            if verdict["action"] == "close":
+                unwind = close_legs(legs, mids)
+                order_type = verdict.get("order_type", "limit")
+                res = submit(unwind, dry_run=dry_run, order_type=order_type)
+                pnl = structure_pnl(legs, verdict["entry"], verdict["value"])
+                rec.update(legs=unwind, exec_ok=res.ok, dry_run=res.dry_run,
+                           pnl=pnl)
+                if res.ok and ledger is not None:
+                    ledger.append(run_date or today.isoformat(), "live",
+                                  "position_closed", symbol=und,
+                                  rule=verdict["rule"], dry_run=res.dry_run,
+                                  pnl=pnl, why=verdict["why"])
+            state[und] = {"quote_gaps": verdict["quote_gaps"]}
+        except Exception as e:                       # noqa: BLE001 -- isolate
+            # Fail loudly for THIS structure and carry on with the others. A
+            # position we could not act on keeps its gap counter, so the
+            # force-close threshold is not silently reset by the failure.
+            rec.setdefault("action", "error")
+            rec.update(exec_ok=False, error=f"{type(e).__name__}: {e}",
+                       rule=rec.get("rule"), dte=rec.get("dte"),
+                       entry=rec.get("entry"), value=rec.get("value"))
+            state[und] = {"quote_gaps": gaps}
+            if ledger is not None:
                 ledger.append(run_date or today.isoformat(), "live",
-                              "position_closed", symbol=und,
-                              rule=verdict["rule"], dry_run=res.dry_run,
-                              why=verdict["why"])
-        state[und] = {"quote_gaps": verdict["quote_gaps"]}
+                              "close_check_error", symbol=und,
+                              error=f"{type(e).__name__}: {e}")
         records.append(rec)
 
+    # `finally`-grade: the round is recorded even when every structure failed.
     STATE.parent.mkdir(parents=True, exist_ok=True)
     with open(STATE, "w", encoding="utf-8") as f:
         json.dump(state, f)
+    LOG.parent.mkdir(parents=True, exist_ok=True)
     with open(LOG, "a", encoding="utf-8") as f:
         for rec in records:
             f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
@@ -285,11 +457,38 @@ if __name__ == "__main__":
               "environment and in the repo-root .env). Nothing checked.",
               file=sys.stderr)
         raise SystemExit(2)
+    # 08-26 adversarial review: this task fires weekdays 12:15 PT with no idea
+    # whether the market is open. On a holiday or after a 13:00 ET half-day
+    # close it would price unwinds off a dead tape.
+    from . import market_calendar
+    from .chain_fetcher import fetch_clock
+    live = "--live" in sys.argv
+    if "--ignore-clock" not in sys.argv:
+        try:
+            state = market_calendar.clock_state(fetch_clock())
+        except Exception as e:  # noqa: BLE001
+            state = None
+            print(f"clock unavailable ({type(e).__name__}); using the built-in "
+                  f"ET calendar", file=sys.stderr)
+        if state is None:
+            state = market_calendar.session_state()
+        if not state[0]:
+            print(f"market closed — {state[1]}. Nothing checked, nothing sent.")
+            raise SystemExit(0)
+    if live and not live_switch_armed():
+        # Fail here rather than inside every unwind: submit_legs raises, and a
+        # raise per structure would have been logged as a close-check error
+        # all week while positions quietly never closed.
+        print("--live requires ALPACA_HACKATHON_LIVE=1 in the environment "
+              "(scripts/run_close_check.cmd sets it). Nothing checked.",
+              file=sys.stderr)
+        raise SystemExit(2)
+
     flips = {}
     for a in sys.argv[1:]:
         if a.startswith("--flip="):
             flips[a.split("=", 1)[1].upper()] = True
-    recs = check_positions(flips=flips, dry_run="--live" not in sys.argv)
+    recs = check_positions(flips=flips, dry_run=not live)
     if not recs:
         print("no open option structures")
     for r in recs:

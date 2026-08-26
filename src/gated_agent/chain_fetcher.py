@@ -34,11 +34,24 @@ def _get(url: str) -> dict:
         return json.loads(r.read())
 
 
+def fetch_account() -> dict:
+    """Raw /v2/account. `equity` sizes the gates; `last_equity` (the previous
+    session's close) gives the day's PnL independently of our own bookkeeping,
+    which is what the -2% halt cross-checks itself against."""
+    return _get(f"{TRADING}/v2/account")
+
+
 def fetch_equity() -> float:
     """Paper-account equity, for gate sizing. (Integration addition to the
     staging module: same read-only auth/_get plumbing, /v2/account endpoint.)"""
-    d = _get(f"{TRADING}/v2/account")
-    return float(d["equity"])
+    return float(fetch_account()["equity"])
+
+
+def fetch_clock() -> dict:
+    """Alpaca's own market clock — authoritative for holidays, early closes,
+    DST and unscheduled closures. The scheduled tasks fire on a weekday
+    calendar that knows none of those things."""
+    return _get(f"{TRADING}/v2/clock")
 
 
 def fetch_spot(symbol: str) -> float:

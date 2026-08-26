@@ -145,6 +145,8 @@ class StubRedTeam(RedTeam):
             "questions": qs,
             "verdict": "veto" if vetoes else "approve",
             "veto_reasons": vetoes,
+            # The stub never fails for infrastructure reasons; it has none.
+            "infra_failure": False,
         }
 
     @staticmethod
@@ -298,13 +300,20 @@ class McpRedTeam(RedTeam):
             return self._protocol(dedup_key, symbol, qs,
                                   "veto" if vetoes else "approve", vetoes)
         except Exception as e:  # noqa: BLE001 -- fail closed
+            # Fail closed for THIS order, but say WHY in a machine-readable
+            # way. A missing claude binary and a considered "this spread is
+            # illiquid" used to leave the identical ledger shape, so a
+            # red-teamer that stopped launching on day 2 produced a week of
+            # plausible-looking vetoes and zero trades. run.redteam_health()
+            # reads this flag and escalates.
             reason = (f"red-team pass failed ({type(e).__name__}); "
                       "fail-closed policy vetoes the order")
             qs = [{"id": qid, "question": QUESTIONS[qid],
                    "answer": "not evaluated: red-team infrastructure failure",
                    "verdict": "veto", "reason": reason}
                   for qid in QUESTION_IDS]
-            return self._protocol(dedup_key, symbol, qs, "veto", [reason])
+            return self._protocol(dedup_key, symbol, qs, "veto", [reason],
+                                  infra_failure=True)
 
     @staticmethod
     def _normalize_questions(raw: dict) -> list:
@@ -326,10 +335,11 @@ class McpRedTeam(RedTeam):
         return out
 
     @staticmethod
-    def _protocol(dedup_key, symbol, questions, verdict, veto_reasons) -> dict:
+    def _protocol(dedup_key, symbol, questions, verdict, veto_reasons,
+                  infra_failure: bool = False) -> dict:
         return {"protocol": "redteam.v1", "order_dedup_key": dedup_key,
                 "symbol": symbol, "questions": questions, "verdict": verdict,
-                "veto_reasons": veto_reasons,
+                "veto_reasons": veto_reasons, "infra_failure": infra_failure,
                 "ts": time.strftime("%Y-%m-%dT%H:%M:%S")}
 
 

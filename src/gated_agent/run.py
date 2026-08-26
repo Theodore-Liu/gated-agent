@@ -18,19 +18,128 @@ from __future__ import annotations
 
 import argparse
 import sys
-from datetime import date
+from datetime import date, datetime, timezone
 
-from . import negctl, position_manager, signals
+from . import market_calendar, negctl, position_manager, signals
 from .gates import dedup_key, run_gates
 from .ledger import Ledger
 from .options_mapper import MapperConfig, map_signal
 from .order_cli import AlpacaCLIBroker, Broker, broker_from_env, load_env
 from .redteam_mcp import RedTeam, StubRedTeam, redteam_from_env
 
+#: Consecutive days of red-team INFRASTRUCTURE failure before the run screams.
+#: Fail-closed is right for one order; silently fail-closed for a whole week
+#: is a safety feature turning into a zero.
+REDTEAM_ALARM_DAYS = 2
+
+
+def market_verdict(clock_source, now: datetime | None = None
+                   ) -> tuple[bool, str]:
+    """Is the market open? Broker clock first, built-in ET calendar second.
+
+    Nothing in this project used to ask. Both scheduled tasks fire on a plain
+    weekday schedule, so a market holiday (2026-09-07 is the first Monday
+    after the contest window) or a 13:00 ET half-day put the agent on a dead
+    tape with live keys.
+
+    The fallback matters as much as the check: blanket-refusing whenever
+    /v2/clock hiccups would let one flaky endpoint cost the whole contest,
+    while assuming "open" would send day orders into a closed market.
+    """
+    try:
+        state = market_calendar.clock_state(clock_source())
+    except Exception as e:  # noqa: BLE001
+        state = None
+        why_clock = f"clock unavailable ({type(e).__name__})"
+    else:
+        why_clock = "clock returned no usable payload"
+    if state is not None:
+        return state
+    open_, why = market_calendar.session_state(now)
+    return open_, f"{why_clock}; fell back to {why}"
+
+
+def redteam_health(ledger: Ledger, run_date: str,
+                   min_days: int = REDTEAM_ALARM_DAYS) -> dict | None:
+    """Alarm when the red-teamer has been broken (not merely strict) for
+    `min_days` consecutive days with red-team activity.
+
+    An infrastructure veto and a considered veto used to leave the identical
+    ledger shape, so a claude CLI that stopped launching on day 2 would have
+    produced a week of "RED-TEAM VETO" lines that look like a cautious agent
+    doing its job — and zero trades in front of the judges.
+    """
+    days: dict[str, list[bool]] = {}
+    for r in ledger.records():
+        if r["kind"] != "redteam" or r["book"] != "live":
+            continue
+        rep = r.get("report") or {}
+        days.setdefault(r["run_date"], []).append(bool(rep.get("infra_failure")))
+    recent = sorted(d for d in days if d <= run_date)[-min_days:]
+    if len(recent) < min_days:
+        return None
+    if not all(days[d] and all(days[d]) for d in recent):
+        return None
+    return {"consecutive_days": len(recent), "days": recent,
+            "why": "every red-team pass on these days failed for "
+                   "INFRASTRUCTURE reasons (binary, MCP server, timeout), not "
+                   "judgement. The agent is fail-closed and therefore not "
+                   "trading at all."}
+
+
+def shadow_exits(ledger: Ledger, run_date: str, today: date) -> list:
+    """Apply R1 (DTE <= dte_close) to the negative control's open positions.
+
+    The shadow book is the signature feature and it was quietly dying. Live
+    positions get closed by R1-R4, which writes `position_closed` and releases
+    the flip guard; shadow positions have no broker and no exit rule, so after
+    its first would-trade in a symbol the coin-flip twin was vetoed on every
+    reverse draw — roughly two days in three. A placebo arm that cannot take
+    the trades the live arm takes is not a placebo arm.
+
+    R1 is the only pre-registered rule computable without quotes, and it is
+    applied verbatim so the comparison is not rigged in either direction.
+    """
+    closed = []
+    for symbol in sorted(ledger.open_positions(book="shadow")):
+        legs = None
+        for r in ledger.records():
+            if (r["book"] == "shadow" and r.get("symbol") == symbol
+                    and r["kind"] == "shadow_would_trade" and r.get("legs")):
+                legs = r["legs"]
+        if not legs:
+            continue
+        expiries = [occ["expiry"] for occ in
+                    (position_manager.parse_occ(l["occ_symbol"]) for l in legs)
+                    if occ]
+        if not expiries:
+            continue
+        dte = min((e - today).days for e in expiries)
+        if dte <= position_manager.DTE_CLOSE:
+            closed.append(ledger.append(
+                run_date, "shadow", "position_closed", symbol=symbol,
+                rule="R1_time", dry_run=False, pnl=None,
+                why=f"shadow twin: DTE {dte} <= {position_manager.DTE_CLOSE}, "
+                    f"same R1 the live book exits on (no order: the shadow "
+                    f"book has no position and no order path)"))
+    return closed
+
+
+def account_day_pnl(broker: Broker) -> float | None:
+    """The account's own equity - last_equity, or None if unavailable."""
+    getter = getattr(broker, "get_account", None)
+    if getter is None:
+        return None
+    try:
+        acct = getter()
+        return float(acct["equity"]) - float(acct["last_equity"])
+    except Exception:  # noqa: BLE001 -- an optional cross-check, never fatal
+        return None
+
 
 def process(symbol: str, signal: dict, book: str, *, broker: Broker,
             ledger: Ledger, redteam: RedTeam, run_date: str,
-            today: date) -> dict | None:
+            today: date, day_pnl: float | None = None) -> dict | None:
     """Run one signal through mapper -> gates -> red-team. Returns the order
     intent dict if one was approved (live book only), else None."""
     ledger.append(run_date, book, "signal", signal=signal)
@@ -56,6 +165,7 @@ def process(symbol: str, signal: dict, book: str, *, broker: Broker,
         already_seen=(book == "live" and ledger.seen_order(key)),
         direction=signal["direction"],
         open_direction=ledger.open_direction(symbol, book=book),
+        account_day_pnl=day_pnl if book == "live" else None,
     )
     ledger.append(run_date, book, "gate_check", symbol=symbol, legs=legs,
                   max_loss=max_loss, dedup_key=key,
@@ -153,6 +263,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--force", action="store_true",
                     help="re-run even if today already completed")
     ap.add_argument("--ledger", default=None, help="ledger JSONL path override")
+    ap.add_argument("--ignore-clock", action="store_true",
+                    help="run even when the market is closed (manual "
+                         "rehearsal only; recorded in the ledger)")
     args = ap.parse_args(argv)
 
     if not args.dry_run and not args.live:
@@ -192,6 +305,24 @@ def main(argv: list[str] | None = None) -> int:
     print(f"gated-agent {mode} — {run_date} "
           f"(equity ${broker.get_equity():,.0f}, {data}, {rt_name})")
 
+    # Is the market actually open? The tasks fire on a weekday calendar that
+    # knows nothing about holidays, half-days or unscheduled closures.
+    if real:
+        now = (datetime.combine(today, datetime.min.time(), timezone.utc)
+               .replace(hour=15) if args.date else None)
+        is_open, why = market_verdict(broker.get_clock, now=now)
+        if not is_open and not args.ignore_clock:
+            ledger.append(run_date, "live", "market_closed", reason=why)
+            print(f"Market closed — {why}. Nothing evaluated, nothing sent; "
+                  f"the day stays open for the next scheduled round.")
+            return 0
+        if not is_open:
+            ledger.append(run_date, "live", "clock_override", reason=why)
+            print(f"WARNING: market is closed ({why}) and --ignore-clock was "
+                  f"passed. Rehearsal only.", file=sys.stderr)
+
+    day_pnl = account_day_pnl(broker) if real else None
+
     # Signals come from a third party (yfinance). One symbol's fetch failing
     # must not take the whole round with it — and above all must not prevent
     # the close checks below from running: an unreachable data source is no
@@ -223,6 +354,12 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print("  [close] stub broker (no Alpaca keys): no positions to check")
 
+    # The negative control's own exits, by the same pre-registered R1. Runs
+    # for every book state, keyless included: the shadow twin has no broker
+    # and therefore nothing else can ever release its flip guard.
+    for rec in shadow_exits(ledger, run_date, today):
+        print(f"  [shadow] {rec['symbol']}: R1 exit — {rec['why']}")
+
     for symbol in signals.UNIVERSE:
         sig = sigs.get(symbol)
         if sig is None:
@@ -234,7 +371,8 @@ def main(argv: list[str] | None = None) -> int:
                                                         sig["spot"]))):
             try:
                 process(symbol, s, book, broker=broker, ledger=ledger,
-                        redteam=redteam, run_date=run_date, today=today)
+                        redteam=redteam, run_date=run_date, today=today,
+                        day_pnl=day_pnl)
             except Exception as e:  # noqa: BLE001 — isolate per symbol/book:
                 # an Alpaca 500 on symbol 4 must not abandon symbol 5, and the
                 # dedup key of anything already sent is burned before the
@@ -244,6 +382,24 @@ def main(argv: list[str] | None = None) -> int:
                               error=f"{type(e).__name__}: {e}")
                 print(f"  [{book}] {symbol}: PIPELINE ERROR "
                       f"({type(e).__name__}: {e})", file=sys.stderr)
+
+    # A red-teamer that has been BROKEN (not strict) for days running means
+    # zero trades, and fail-closed makes that look identical to caution.
+    alarm = redteam_health(ledger, run_date)
+    if alarm:
+        errors += 1
+        ledger.append(run_date, "live", "redteam_infra_alarm", **alarm)
+        banner = "=" * 72
+        print(f"\n{banner}\n"
+              f"ALARM: RED-TEAM INFRASTRUCTURE HAS FAILED "
+              f"{alarm['consecutive_days']} DAYS RUNNING "
+              f"({', '.join(alarm['days'])}).\n"
+              f"Every order is being vetoed by the fail-closed path, so the "
+              f"agent is not trading\nat all. This is NOT the gates working "
+              f"— it is the red-teamer failing to launch.\nCheck: claude CLI "
+              f"on PATH / CLAUDE_BIN in .env, the Alpaca MCP server in "
+              f".venv-mcp,\nand logs/daily.log for the exception type.\n"
+              f"{banner}\n", file=sys.stderr)
 
     if errors:
         # No run_complete record: the day is NOT marked done, so the next

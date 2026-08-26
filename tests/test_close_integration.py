@@ -35,6 +35,22 @@ MIDS_FLAT = {f"SPY{YMD}C00764000": 4.00, f"SPY{YMD}C00783000": 1.20}  # V=E
 MIDS_GAP = {f"SPY{YMD}C00764000": 4.00, f"SPY{YMD}C00783000": None}
 
 
+class AcceptedStubBroker(StubCLIBroker):
+    """Stub whose orders come back ACCEPTED by the broker.
+
+    Needed since the 08-26 review: a `dry_run` status opens nothing in the
+    ledger's believed book, because a rehearsal on a box with real keys used
+    to write an order_intent carrying a direction and froze every symbol
+    behind the flip guard. Tests about the flip guard therefore have to set up
+    a position the way a LIVE run does, not the way a rehearsal does.
+    """
+
+    def submit_order(self, symbol, legs, key):
+        record = super().submit_order(symbol, legs, key)
+        record["status"] = "submitted"
+        return record
+
+
 @pytest.fixture()
 def sandbox(tmp_path, monkeypatch):
     """Route position_manager's runtime state/log into tmp; capture executor
@@ -82,7 +98,7 @@ def test_flip_close_ordering_admits_reverse_entry(sandbox):
     """Day 1: open long. Day 2: reverse signal -> close checks run FIRST,
     R4 closes the long and records position_closed -> the flip gate then
     admits the short open in the same run."""
-    broker, ledger = StubCLIBroker(dry_run=True), sandbox["ledger"]
+    broker, ledger = AcceptedStubBroker(dry_run=True), sandbox["ledger"]
     rt_stub = StubRedTeam()
     day1 = process("SPY", dict(LONG_SIG), "live", broker=broker, ledger=ledger,
                    redteam=rt_stub, run_date="2026-08-30",
@@ -106,7 +122,7 @@ def test_flip_close_ordering_admits_reverse_entry(sandbox):
 def test_same_direction_signal_does_not_flip_close(sandbox):
     """flip_close only fires on a REVERSE signal vs. the ledger's open
     direction; a same-direction signal leaves the structure alone."""
-    broker, ledger = StubCLIBroker(dry_run=True), sandbox["ledger"]
+    broker, ledger = AcceptedStubBroker(dry_run=True), sandbox["ledger"]
     process("SPY", dict(LONG_SIG), "live", broker=broker, ledger=ledger,
             redteam=StubRedTeam(), run_date="2026-08-30",
             today=date(2026, 8, 30))
@@ -120,7 +136,7 @@ def test_same_direction_signal_does_not_flip_close(sandbox):
 def test_failed_close_keeps_flip_guard_engaged(sandbox):
     """If the unwind order errors, no position_closed is written and the
     reverse open stays blocked — fail-closed end to end."""
-    broker, ledger = StubCLIBroker(dry_run=True), sandbox["ledger"]
+    broker, ledger = AcceptedStubBroker(dry_run=True), sandbox["ledger"]
     rt_stub = StubRedTeam()
     process("SPY", dict(LONG_SIG), "live", broker=broker, ledger=ledger,
             redteam=rt_stub, run_date="2026-08-30", today=date(2026, 8, 30))

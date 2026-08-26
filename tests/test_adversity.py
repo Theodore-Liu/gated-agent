@@ -90,11 +90,20 @@ def test_signal_source_failure_does_not_disable_the_exit_rules(
     def boom(_symbol):
         raise TimeoutError("yfinance unreachable")
 
+    def offline_broker(**kw):
+        # The real adapter, but with every network hop stubbed. Before the
+        # 08-26 review this test built an AlpacaCLIBroker and let it call
+        # /v2/account for real: on a box with keys in .env the "offline" suite
+        # was quietly hitting the live paper account.
+        b = AlpacaCLIBroker(dry_run=True, executor=lambda *a, **k: None)
+        b.get_equity = lambda: 100_000.0
+        b.get_account = lambda: {"equity": "100000", "last_equity": "100000"}
+        b.get_clock = lambda: {"is_open": True}
+        return b
+
     monkeypatch.setattr(signals, "UNIVERSE", ("SPY",))
     monkeypatch.setattr(signals, "live_signal", boom)
-    monkeypatch.setattr(run_mod, "broker_from_env",
-                        lambda **kw: AlpacaCLIBroker(
-                            dry_run=True, executor=lambda *a, **k: None))
+    monkeypatch.setattr(run_mod, "broker_from_env", offline_broker)
     monkeypatch.setattr(run_mod, "redteam_from_env", StubRedTeam)
     monkeypatch.setattr(run_mod, "close_checks",
                         lambda *a, **k: calls.append("close") or [])

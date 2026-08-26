@@ -17,8 +17,24 @@ STRONG_LONG = {"symbol": "SPY", "direction": "long", "strength": 0.9,
                "spot": 640.0}
 
 
-def setup(tmp_path):
-    return (StubCLIBroker(dry_run=True), Ledger(tmp_path / "l.jsonl"),
+class AcceptedStubBroker(StubCLIBroker):
+    """Stub whose orders come back ACCEPTED by the broker.
+
+    Since the 08-26 review a `dry_run` status opens nothing in the ledger's
+    believed book: a rehearsal on a box with real keys used to write an
+    order_intent carrying a direction, which froze every symbol behind the
+    flip guard. A test about the flip guard has to set the position up the
+    way a LIVE run does, not the way a rehearsal does.
+    """
+
+    def submit_order(self, symbol, legs, key):
+        record = super().submit_order(symbol, legs, key)
+        record["status"] = "submitted"
+        return record
+
+
+def setup(tmp_path, broker_cls=StubCLIBroker):
+    return (broker_cls(dry_run=True), Ledger(tmp_path / "l.jsonl"),
             StubRedTeam())
 
 
@@ -57,7 +73,7 @@ def test_shadow_book_never_reaches_broker(tmp_path):
 
 
 def test_flip_guard_blocks_reverse_open_across_days(tmp_path):
-    broker, ledger, rt = setup(tmp_path)
+    broker, ledger, rt = setup(tmp_path, AcceptedStubBroker)
     first = process("SPY", dict(STRONG_LONG), "live", broker=broker,
                     ledger=ledger, redteam=rt, run_date=RUN_DATE, today=TODAY)
     assert first is not None                          # long position now open

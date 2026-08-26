@@ -76,6 +76,19 @@ if errorlevel 1 (
   exit /b 1
 )
 
+rem A task registered by schtasks does NOT get StartWhenAvailable: if the box
+rem is asleep, rebooting or switched off at 07:00, that run is skipped and
+rem nothing anywhere says so - a silent no-trade day in a one-week contest.
+rem schtasks has no flag for it, so set it through the Scheduler cmdlets.
+rem Safe to catch up late: the day is idempotent (run_complete) and the dedup
+rem key no longer drifts with the quote, so a late start cannot double send.
+rem Non-fatal - the tasks themselves are registered by this point.
+echo Enabling StartWhenAvailable on both tasks (catch up a missed start)...
+rem -ErrorAction Stop is load-bearing: Set-ScheduledTask fails NON-terminating,
+rem so without it the catch never fires and the user sees a red PowerShell
+rem error blob in the middle of a script that otherwise succeeded.
+powershell -NoProfile -ExecutionPolicy Bypass -Command "foreach ($n in 'GatedAgentDaily','GatedAgentCloseCheck') { try { $s = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew; Set-ScheduledTask -TaskName $n -Settings $s -ErrorAction Stop | Out-Null; Write-Host ('  ' + $n + ': StartWhenAvailable set') } catch { Write-Host ('  ' + $n + ': could not set StartWhenAvailable - ' + $_.Exception.Message) } }"
+
 echo OK. Verify with:
 echo   schtasks /Query /TN GatedAgentDaily /V /FO LIST
 echo   schtasks /Query /TN GatedAgentCloseCheck /V /FO LIST
