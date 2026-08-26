@@ -175,9 +175,17 @@ def process(symbol: str, signal: dict, book: str, *, broker: Broker,
         print(f"  [{book}] {symbol}: GATE VETO — {vetoes}")
         return None
 
+    # 08-26 live round: the red team was told to "inspect the LIVE account",
+    # so when it reviewed a SHADOW proposal it judged concentration against
+    # the LIVE book's positions — both books share one paper account. The
+    # shadow book is a negative control and holds nothing, ever; letting it
+    # inherit the live book's exposure makes the control more conservative as
+    # the live book fills, for reasons unrelated to signal quality. Tell the
+    # reviewer whose positions are whose instead of letting it guess.
     report = redteam.review(symbol=symbol, dedup_key=key, legs=legs,
                             chain_by_symbol=chain_by_symbol,
-                            max_loss=max_loss, equity=equity)
+                            max_loss=max_loss, equity=equity, book=book,
+                            book_positions=ledger.open_positions(book=book))
     ledger.append(run_date, book, "redteam", report=report)
     if report["verdict"] == "veto":
         print(f"  [{book}] {symbol}: RED-TEAM VETO — "

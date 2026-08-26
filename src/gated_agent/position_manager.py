@@ -59,6 +59,7 @@ _FROZEN_DEFAULTS = {                    # mirror of config/close_rules.json --
     "valuation": "snapshot_mid",
     "max_quote_gaps": 3,
     "check_times": ["open+30min", "close-45min"],
+    "close_cross_frac": 1.0,       # execution, added 08-26 (see below)
 }
 
 
@@ -83,6 +84,12 @@ SL_MULT_CREDIT = CLOSE_CONFIG["sl_credit_mult"]
 FLIP_CLOSE = CLOSE_CONFIG["flip_close"]               # R4 enabled?
 MAX_QUOTE_GAPS = CLOSE_CONFIG["max_quote_gaps"]       # force-close threshold
 CHECK_TIMES = CLOSE_CONFIG["check_times"]             # scheduler contract
+# EXECUTION, not a rule. The frozen R1-R4 thresholds above decide WHETHER
+# to close; this decides at what price the resulting order is sent, and
+# it was a latent defect: mid-priced closes rest instead of filling.
+# Added 2026-08-26 after a live close asked 4.00 credit against an
+# executable 3.82. 1.0 = price at the executable side, 0.0 = old mid.
+CLOSE_CROSS_FRAC = float(CLOSE_CONFIG.get("close_cross_frac", 1.0))
 
 _OCC = re.compile(r"^([A-Z]{1,6})(\d{6})([CP])(\d{8})$")
 
@@ -222,8 +229,20 @@ def reconcile(ledger, run_date: str, actual: dict) -> list:
     return records
 
 
+#: Per-leg book, kept alongside the mid so a close can be priced where it
+#: actually trades. `mids` stays the valuation input (frozen config says
+#: valuation = snapshot_mid) — this is the EXECUTION side, a different thing
+#: that happened to reuse the same number until 2026-08-26.
+QUOTES: dict = {}
+
+
 def fetch_mids(symbols: list) -> dict:
-    """OCC symbol -> mid, or None when bid/ask missing (quote gap)."""
+    """OCC symbol -> mid, or None when bid/ask missing (quote gap).
+
+    Also records each leg's bid/ask in `QUOTES`: valuation wants the mid, but
+    an ORDER priced at mid rests instead of filling (measured 2026-08-26 — a
+    close asked 4.00 credit while the executable credit was 3.82).
+    """
     mids: dict = {}
     for i in range(0, len(symbols), 100):
         batch = ",".join(symbols[i:i + 100])
@@ -232,13 +251,29 @@ def fetch_mids(symbols: list) -> dict:
         for sym, s in (d.get("snapshots") or {}).items():
             q = s.get("latestQuote") or {}
             bid, ask = float(q.get("bp") or 0), float(q.get("ap") or 0)
-            mids[sym] = round((bid + ask) / 2, 2) if bid > 0 and ask > 0 else None
+            if bid > 0 and ask > 0:
+                mids[sym] = round((bid + ask) / 2, 2)
+                QUOTES[sym] = {"bid": bid, "ask": ask}
+            else:
+                mids[sym] = None
     return {s: mids.get(s) for s in symbols}
 
 
 def group_structures(positions: list) -> dict:
-    """Group legs by underlying: one structure per underlying by design
-    (the direction-flip gate forbids a second same-underlying entry)."""
+    """Group legs into structures, keyed by underlying.
+
+    08-26 live round: this grouped by underlying ALONE, on the stated premise
+    that the flip gate forbids a second same-underlying entry. It does not —
+    it forbids a second entry in the OPPOSITE direction. A same-direction
+    re-entry is legal and happened the same morning, leaving SPY with four
+    legs across two expiries. `structure_direction` needs exactly one long
+    and one short, returned None for the four-leg blob, reconciliation read
+    "the broker does not have SPY", and RELEASED the flip guard on a position
+    the account was actually holding — the precise state gate 4 exists to
+    prevent. Legs are grouped per (underlying, expiry) now; the returned dict
+    stays keyed by underlying, with every leg of that underlying present, so
+    valuation and unwinding are unchanged.
+    """
     groups: dict = {}
     for p in positions:
         occ = parse_occ(p["occ_symbol"])
@@ -246,6 +281,28 @@ def group_structures(positions: list) -> dict:
             continue
         groups.setdefault(occ["underlying"], []).append({**p, **occ})
     return groups
+
+
+def substructures(legs: list) -> list:
+    """Split one underlying's legs into per-expiry structures."""
+    by_exp: dict = {}
+    for leg in legs:
+        by_exp.setdefault(leg["expiry"], []).append(leg)
+    return [by_exp[k] for k in sorted(by_exp)]
+
+
+def book_direction(legs: list) -> str | None:
+    """Direction of an underlying's whole book: the shared direction of its
+    per-expiry structures, or None when they genuinely disagree.
+
+    Never returns None merely because there is more than one structure — that
+    conflation is what released the guard on a live position.
+    """
+    dirs = {d for sub in substructures(legs)
+            if (d := structure_direction(sub)) is not None}
+    if len(dirs) == 1:
+        return dirs.pop()
+    return None
 
 
 def _signed_value(legs: list, price_of) -> float | None:
@@ -280,9 +337,17 @@ def evaluate(legs: list, mids: dict, today: date,
                 "why": f"missing mid on some leg (round {gaps}/{MAX_QUOTE_GAPS})"}
 
     if dte <= DTE_CLOSE:                                        # R1
+        # 08-26 live round: a close priced at snapshot mid did not fill —
+        # mid was 3.93 while the immediately executable credit was 3.82, so
+        # the order sat. For R2/R3/R4 that is fine, they can wait a round.
+        # R1 exists precisely to GUARANTEE we are out before pin/assignment
+        # week, and a limit that never fills defeats the entire rule: the
+        # position rides into expiry, which is the one outcome R1 forbids.
+        # Urgency-tiered: the rule that must complete crosses the spread.
         return {**base, "action": "close", "rule": "R1_time", "quote_gaps": 0,
-                "order_type": "limit",
-                "why": f"DTE {dte} <= {DTE_CLOSE}: avoid pin/assignment week"}
+                "order_type": "market",
+                "why": f"DTE {dte} <= {DTE_CLOSE}: avoid pin/assignment week "
+                       f"(market order — this close must complete, not rest)"}
     if entry:                                                   # R2 / R3
         tp = entry * (TP_MULT_DEBIT if kind == "debit" else TP_MULT_CREDIT)
         sl = entry * (SL_MULT_DEBIT if kind == "debit" else SL_MULT_CREDIT)
@@ -303,7 +368,7 @@ def evaluate(legs: list, mids: dict, today: date,
             "why": "no rule triggered"}
 
 
-def close_legs(legs: list, mids: dict) -> list:
+def close_legs(legs: list, mids: dict, quotes: dict | None = None) -> list:
     """Reverse every leg with explicit *_to_close intents, priced at mid.
     cli_executor._net_limit keeps the sign (credit close = negative limit).
 
@@ -313,15 +378,27 @@ def close_legs(legs: list, mids: dict) -> list:
     that legitimately has no price is the quote-gap force-close, which goes
     out as an explicit market order.
     """
+    quotes = quotes or {}
     out = []
     for leg in legs:
         long = leg["qty"] > 0
         mid = mids.get(leg["occ_symbol"])
+        # Price where the leg actually trades, not at the mid. Selling a long
+        # leg fills at the bid; buying back a short fills at the ask. Pricing
+        # both at mid asks the market for a better-than-market print, and the
+        # order rests — which is merely slow for R2/R3/R4 and outright breaks
+        # R1, whose whole purpose is to be OUT before assignment week.
+        # CLOSE_CROSS_FRAC=1.0 crosses fully; 0.0 restores the old mid pricing.
+        q = QUOTES.get(leg["occ_symbol"]) or quotes.get(leg["occ_symbol"]) or {}
+        px = mid
+        if (mid or 0) > 0 and q.get("bid") and q.get("ask"):
+            target = q["bid"] if long else q["ask"]
+            px = round(mid + (target - mid) * CLOSE_CROSS_FRAC, 2)
         out.append({"occ_symbol": leg["occ_symbol"],
                     "side": "sell" if long else "buy",
                     "position_intent": "sell_to_close" if long else "buy_to_close",
                     "qty": abs(leg["qty"]),
-                    "limit": mid if (mid or 0) > 0 else None})
+                    "limit": px if (px or 0) > 0 else None})
     return out
 
 
@@ -388,8 +465,23 @@ def check_positions(flips: dict | None = None, *, dry_run: bool = True,
         if raw_positions is not None:
             detect_non_option_positions(raw_positions, ledger=ledger,
                                         run_date=run_date)
+        # book_direction, not structure_direction: an underlying may hold
+        # several same-direction structures (two expiries), and calling that
+        # "no position" would release the flip guard on a live book.
         actual = {und: d for und, legs in groups.items()
-                  if (d := structure_direction(legs))}
+                  if (d := book_direction(legs))}
+        # An underlying we hold but cannot read the direction of is NOT flat.
+        # Reconciliation may only retire a belief when the broker truly has
+        # nothing; anything else is a loud unknown, never a silent release.
+        unreadable = [und for und, legs in groups.items()
+                      if legs and book_direction(legs) is None]
+        for und in unreadable:
+            ledger.append(run_date or today.isoformat(), "live",
+                          "position_direction_unknown", symbol=und,
+                          why="legs are held but their direction cannot be "
+                              "inferred (mixed directions, or a shape no rule "
+                              "models). The flip guard stays as it is: an "
+                              "unreadable book is not an empty one.")
         reconcile(ledger, run_date or today.isoformat(), actual)
 
     records = []
@@ -488,7 +580,15 @@ if __name__ == "__main__":
     for a in sys.argv[1:]:
         if a.startswith("--flip="):
             flips[a.split("=", 1)[1].upper()] = True
-    recs = check_positions(flips=flips, dry_run=not live)
+    # 08-26 live round: this entry called check_positions WITHOUT a ledger, so
+    # a close it executed at the broker was never recorded. Measured: the R4
+    # unwind filled, NVDA left the account — and the flip guard still believed
+    # NVDA was open, because `position_closed` is what releases it. This entry
+    # IS the afternoon scheduled task's payload, so every close it ever made
+    # would have locked its symbol out for the rest of the contest while the
+    # account sat flat. The daily run passed a ledger; this path never did.
+    from .ledger import Ledger
+    recs = check_positions(flips=flips, dry_run=not live, ledger=Ledger())
     if not recs:
         print("no open option structures")
     for r in recs:

@@ -187,3 +187,93 @@ def test_mcp_redteam_fail_closed_through_pipeline(tmp_path, monkeypatch):
     report = [r for r in ledger.day(RUN_DATE, "live")
               if r["kind"] == "redteam"][0]["report"]
     assert report["verdict"] == "veto" and report["protocol"] == "redteam.v1"
+
+
+# ── 08-26 live round: a close priced at mid rests instead of filling ────────
+
+def test_close_prices_at_the_executable_side_not_mid():
+    """Measured live: the close asked 4.00 credit while the executable credit
+    was 3.82, so it sat unfilled. Selling a long leg fills at the BID; buying
+    back a short fills at the ASK. Mid asks the market for a better-than-
+    market print."""
+    legs = [{"occ_symbol": "NVDA260831C00212500", "qty": 2, "entry": 6.05,
+             "type": "call", "strike": 212.5},
+            {"occ_symbol": "NVDA260831C00225000", "qty": -2, "entry": 2.05,
+             "type": "call", "strike": 225.0}]
+    mids = {"NVDA260831C00212500": 5.92, "NVDA260831C00225000": 1.99}
+    quotes = {"NVDA260831C00212500": {"bid": 5.82, "ask": 6.02},
+              "NVDA260831C00225000": {"bid": 1.98, "ask": 2.00}}
+    out = pm.close_legs(legs, mids, quotes)
+    by = {l["occ_symbol"]: l for l in out}
+    assert by["NVDA260831C00212500"]["side"] == "sell"
+    assert by["NVDA260831C00212500"]["limit"] == 5.82      # the bid
+    assert by["NVDA260831C00225000"]["side"] == "buy"
+    assert by["NVDA260831C00225000"]["limit"] == 2.00      # the ask
+    net = 5.82 - 2.00
+    assert net < (5.92 - 1.99), "crossing must ask for LESS credit than mid"
+
+
+def test_close_falls_back_to_mid_without_a_book():
+    """No bid/ask (offline, injected mids, a feed hiccup) -> old behaviour,
+    never a crash and never an unpriced leg."""
+    legs = [{"occ_symbol": "SPY260904C00640000", "qty": 1, "entry": 3.0,
+             "type": "call", "strike": 640.0}]
+    out = pm.close_legs(legs, {"SPY260904C00640000": 2.5}, {})
+    assert out[0]["limit"] == 2.5
+
+
+def test_r1_escalates_to_a_market_order():
+    """R1 exists to GUARANTEE we are out before pin/assignment week. A limit
+    that never fills leaves the position riding into expiry — the one outcome
+    R1 forbids. R2/R3/R4 can rest a round; R1 cannot."""
+    exp = date(2026, 9, 1)
+    ymd = exp.strftime("%y%m%d")
+    legs = [{"occ_symbol": f"SPY{ymd}C00764000", "qty": 1, "entry": 4.0,
+             "type": "call", "strike": 764.0, "expiry": exp}]
+    v = pm.evaluate(legs, {f"SPY{ymd}C00764000": 4.0}, date(2026, 8, 31))
+    assert v["rule"] == "R1_time"
+    assert v["order_type"] == "market"
+
+
+def test_frozen_thresholds_were_not_touched():
+    """The execution fix must not have moved a single pre-registered rule."""
+    assert (pm.DTE_CLOSE, pm.TP_MULT_DEBIT, pm.TP_MULT_CREDIT,
+            pm.SL_MULT_DEBIT, pm.SL_MULT_CREDIT, pm.MAX_QUOTE_GAPS) == \
+        (2, 1.5, 0.5, 0.5, 2.0, 3)
+    assert pm.FLIP_CLOSE is True
+    assert pm.CLOSE_CONFIG["valuation"] == "snapshot_mid"
+
+
+# ── 08-26: two same-direction structures must not read as "flat" ────────────
+
+def _spread(exp_ymd, k1, k2, qty):
+    from datetime import datetime as _dt
+    e = _dt.strptime(exp_ymd, "%y%m%d").date()
+    return [{"occ_symbol": f"SPY{exp_ymd}C00{int(k1*1000):06d}", "qty": qty,
+             "strike": k1, "type": "call", "expiry": e, "entry": 4.0},
+            {"occ_symbol": f"SPY{exp_ymd}C00{int(k2*1000):06d}", "qty": -qty,
+             "strike": k2, "type": "call", "expiry": e, "entry": 1.0}]
+
+
+def test_two_same_direction_spreads_read_as_that_direction():
+    """Measured live 2026-08-26: a legal same-direction re-entry left SPY with
+    four legs across two expiries. structure_direction wants exactly one long
+    and one short, returned None, and reconciliation concluded the broker had
+    no SPY — releasing the flip guard on a position the account was holding.
+    That is precisely the hedged-book state gate 4 exists to prevent."""
+    legs = _spread("260831", 766.0, 773.0, 3) + _spread("260911", 768.0, 780.0, 2)
+    assert pm.structure_direction(legs) is None      # the old, conflating read
+    assert pm.book_direction(legs) == "long"         # the whole book's sense
+    assert len(pm.substructures(legs)) == 2
+
+
+def test_genuinely_opposed_structures_stay_unknown():
+    """Disagreeing structures must NOT be summarized into a direction — that
+    would be guessing about exactly the state we refuse to hold."""
+    bull = _spread("260831", 766.0, 773.0, 2)
+    bear = _spread("260911", 780.0, 768.0, 2)       # long higher strike = short
+    assert pm.book_direction(bull + bear) is None
+
+
+def test_single_spread_direction_is_unchanged():
+    assert pm.book_direction(_spread("260831", 766.0, 773.0, 3)) == "long"

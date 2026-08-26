@@ -9,5 +9,10 @@
   "flip_close": true,
   "valuation": "snapshot_mid",
   "max_quote_gaps": 3,
-  "check_times": ["open+30min", "close-45min"]
+  "check_times": [
+    "open+30min",
+    "close-45min"
+  ],
+  "_execution_note": "close_cross_frac is EXECUTION, not a rule: the R1-R4 thresholds above are unchanged from the 2026-08-24 freeze and decide WHETHER to close. This decides the price of the resulting order. Added 2026-08-26 after live-fire testing showed a close priced at snapshot mid does not fill (asked 4.00 credit, executable was 3.82) - merely slow for R2/R3/R4, but it defeats R1, whose entire purpose is to be OUT before assignment week. R1 also escalated to a market order for the same reason. No threshold was touched.",
+  "close_cross_frac": 1.0
 }

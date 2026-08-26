@@ -85,7 +85,9 @@ class StubRedTeam(RedTeam):
     """
 
     def review(self, *, symbol, dedup_key, legs, chain_by_symbol, max_loss,
-               equity) -> dict:
+               equity, book="live", book_positions=None) -> dict:
+        # book/book_positions are part of the contract (see MCP_PROMPT) but the
+        # stub judges each proposal in isolation, so it ignores them.
         qs = []
 
         # 1. max-loss scenario
@@ -231,12 +233,27 @@ Alpaca paper account. A deterministic strategy proposes this order:
 Context computed by the deterministic pipeline (verify, don't trust):
   underlying={symbol}  max_loss_estimate={max_loss}  account_equity={equity}
 
-Use your read-only Alpaca tools to inspect the LIVE account and market state,
-then answer EXACTLY these three questions:
+BOOK UNDER REVIEW: {book}
+Positions belonging to THIS book: {book_positions}
+
+That list is authoritative and complete. The Alpaca account may hold other
+option positions; they belong to a DIFFERENT book and are NOT yours. Judge
+concentration and greeks stacking against the list above ONLY — never against
+whatever `get_all_positions` returns.
+
+(Why this matters: the shadow book is a negative control that runs this exact
+pipeline on a RANDOM signal, and it holds nothing, ever. Both books share one
+paper account, so an LLM that judged shadow proposals against the live book's
+positions would make the control more conservative as the live book filled up
+— for reasons having nothing to do with signal quality. That silently biases
+the whole comparison. Observed live on 2026-08-26 before this was pinned.)
+
+Use your read-only Alpaca tools for MARKET state (quotes, greeks, chains) and
+answer EXACTLY these three questions:
 1. id "max_loss_scenario": What exactly is lost in the worst case, and is that
    number computed or guessed? (recompute it yourself from the legs)
 2. id "greeks_exposure": What is the directional/vol exposure, and does it
-   stack dangerously with existing positions? (check positions via tools)
+   stack dangerously with THIS BOOK's positions listed above?
 3. id "liquidity_exit": If we must exit at tomorrow's open, what does the exit
    cost through this spread? (check live quotes for each leg)
 
@@ -275,14 +292,17 @@ class McpRedTeam(RedTeam):
         self.timeout = timeout
 
     def review(self, *, symbol, dedup_key, legs, chain_by_symbol, max_loss,
-               equity) -> dict:
+               equity, book="live", book_positions=None) -> dict:
         import subprocess
         try:
             sandbox = _ROOT / "ledger" / ".redteam_sandbox"
             sandbox.mkdir(parents=True, exist_ok=True)
+            held = (json.dumps(book_positions) if book_positions
+                    else "NONE — this book holds no option positions.")
             prompt = MCP_PROMPT.format(proposal=json.dumps(legs, indent=1),
                                        symbol=symbol, max_loss=max_loss,
-                                       equity=equity)
+                                       equity=equity, book=book,
+                                       book_positions=held)
             r = subprocess.run(
                 [_claude_bin(), "-p", "--mcp-config", _mcp_config(),
                  "--allowedTools", READONLY_TOOLS,
