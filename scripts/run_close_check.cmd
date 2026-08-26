@@ -11,10 +11,22 @@ rem without log redirection fails silently with nothing but rc=1.
 rem ---------------------------------------------------------------------
 setlocal
 set "ROOT=%~dp0.."
+for %%I in ("%ROOT%") do set "ROOT=%%~fI"
 set "LOG=%ROOT%\logs\close_check.log"
 if not exist "%ROOT%\logs" mkdir "%ROOT%\logs"
 
+rem A task registered with schtasks /TR has NO start-in directory: it inherits
+rem %windir%\system32. Run from the repo so relative paths mean what they
+rem meant in testing. The Python side no longer depends on this (paths.py
+rem anchors every artifact on the repo root) - this is the second lock.
+cd /d "%ROOT%"
+
 echo ===== gated-agent close check %DATE% %TIME% ===== >> "%LOG%"
+
+if not exist "%ROOT%\.venv\Scripts\python.exe" (
+  echo FATAL: interpreter not found at %ROOT%\.venv\Scripts\python.exe >> "%LOG%"
+  exit /b 1
+)
 
 rem Default mode evaluates only (dry run). On go-live day (8/28+), add
 rem --live below so confirmed closes actually submit through the CLI path.

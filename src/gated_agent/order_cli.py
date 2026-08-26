@@ -26,7 +26,7 @@ from abc import ABC, abstractmethod
 from datetime import date, timedelta
 from pathlib import Path
 
-from . import chain_fetcher, cli_executor
+from . import chain_fetcher, cli_executor, paths
 
 
 # ── OCC symbology helpers ────────────────────────────────────────────────
@@ -177,9 +177,18 @@ def load_env(path: str | os.PathLike = ".env") -> dict[str, str]:
     switches that test for key presence (e.g. the red-team activation).
     Accepts both naming schemes and mirrors ALPACA_API_KEY_ID /
     ALPACA_API_SECRET_KEY onto the ALPACA_API_KEY / ALPACA_SECRET_KEY names
-    that chain_fetcher reads. Missing file -> no-op (stub mode)."""
+    that chain_fetcher reads. Missing file -> no-op (stub mode).
+
+    A *relative* path that does not exist in the CWD is retried against the
+    repo root. Without that, a scheduled task (CWD = %windir%\\system32) finds
+    no .env at all and the run degrades silently to the synthetic-chain stub
+    — the same trap as the 08-25 position_manager finding, one layer down:
+    that fix called load_env(), but load_env() itself was CWD-dependent.
+    """
     loaded: dict[str, str] = {}
     p = Path(path)
+    if not p.exists() and not p.is_absolute():
+        p = paths.anchored(p)
     if p.exists():
         for line in p.read_text(encoding="utf-8").splitlines():
             line = line.strip()

@@ -42,8 +42,9 @@ from pathlib import Path
 
 from .chain_fetcher import DATA, TRADING, _headers
 from .cli_executor import submit_legs
+from .paths import ROOT
 
-_ROOT = Path(__file__).resolve().parents[2]           # src/gated_agent -> repo
+_ROOT = ROOT                     # repo root, never the CWD (see paths.py)
 CONFIG_PATH = _ROOT / "config" / "close_rules.json"
 STATE = _ROOT / "ledger" / ".position_state.json"     # runtime, gitignored
 LOG = _ROOT / "ledger" / "close_log.jsonl"
@@ -272,8 +273,18 @@ if __name__ == "__main__":
     # 08-25 live-test R2 finding: the standalone entry (the afternoon
     # scheduled task's payload) never loaded .env — keys were only loaded
     # by run.main(), so this path fail-crashed on a box that relies on .env.
-    from .order_cli import load_env
+    # 08-26 follow-up: load_env() itself resolved ".env" against the CWD, so
+    # under the scheduled task (CWD = %windir%\system32) this fix did not
+    # actually hold. It is repo-anchored now; see paths.py.
+    from .order_cli import have_alpaca_keys, load_env
     load_env()
+    if not have_alpaca_keys():
+        # Fail loudly and early rather than as a traceback out of _headers()
+        # several HTTP calls deep. No positions are touched.
+        print("ALPACA_API_KEY / ALPACA_SECRET_KEY not set (looked in the "
+              "environment and in the repo-root .env). Nothing checked.",
+              file=sys.stderr)
+        raise SystemExit(2)
     flips = {}
     for a in sys.argv[1:]:
         if a.startswith("--flip="):

@@ -102,6 +102,12 @@ def fetch_chain(symbol: str, today: date, min_dte: int = 5, max_dte: int = 16,
 if __name__ == "__main__":
     import sys
     from gated_agent.options_mapper import MapperConfig, map_signal
+    # Same defect the 08-25 sweep found in position_manager's standalone
+    # entry: every `python -m` entry point must load .env itself, because
+    # only run.main() used to. Without this, `python -m gated_agent.
+    # chain_fetcher SPY` dies in _headers() on a box that keeps keys in .env.
+    from gated_agent.order_cli import load_env
+    load_env()
 
     sym = sys.argv[1] if len(sys.argv) > 1 else "SPY"
     today = date.today()

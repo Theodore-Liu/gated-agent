@@ -21,6 +21,14 @@ rem   Both      : wscript //B run_hidden.vbs <payload> (no console flash;
 rem               payloads append to logs\daily.log / logs\close_check.log)
 rem   Runs as   : the current user, only while logged on (no password)
 rem
+rem   NOTE on the working directory: schtasks /TR cannot set a start-in
+rem   folder, so both tasks inherit %windir%\system32 as their CWD. Each
+rem   payload therefore does `cd /d` to the repo itself, and the Python side
+rem   anchors every artifact on the repo root (src/gated_agent/paths.py)
+rem   rather than the CWD. Do not "simplify" either one away: a CWD-relative
+rem   ledger silently forks the one file that dedup, the once-per-day guard,
+rem   the direction-flip guard and the daily loss halt all read.
+rem
 rem   If the box is NOT in US Pacific time, recompute both /ST values:
 rem   target 10:00 and 15:15 US Eastern market time.
 rem

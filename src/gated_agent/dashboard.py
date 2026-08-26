@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 import urllib.request
 
@@ -21,6 +22,20 @@ import streamlit as st
 
 TRADING = "https://paper-api.alpaca.markets"
 _ROOT = Path(__file__).resolve().parents[2]           # src/gated_agent -> repo
+
+# Streamlit executes this file as a top-level script, not as a package module,
+# so relative imports are unavailable and the package may not be on sys.path.
+# Without this the dashboard was the one entry point that never loaded .env:
+# it worked on Streamlit Cloud (secrets.toml) and reported "Account API
+# unreachable" on the very box that runs the agent, where .env IS the source
+# of truth. Same family as the 08-25 findings.
+try:
+    if str(_ROOT / "src") not in sys.path:
+        sys.path.insert(0, str(_ROOT / "src"))
+    from gated_agent.order_cli import load_env
+    load_env(_ROOT / ".env")          # absent on Cloud -> no-op, secrets win
+except Exception:  # noqa: BLE001 -- a dashboard must render without the package
+    pass
 
 st.set_page_config(page_title="Gated Agent — Live State", layout="wide")
 

@@ -24,7 +24,7 @@ from . import negctl, position_manager, signals
 from .gates import dedup_key, run_gates
 from .ledger import Ledger
 from .options_mapper import MapperConfig, map_signal
-from .order_cli import AlpacaCLIBroker, Broker, broker_from_env
+from .order_cli import AlpacaCLIBroker, Broker, broker_from_env, load_env
 from .redteam_mcp import RedTeam, StubRedTeam, redteam_from_env
 
 
@@ -83,6 +83,16 @@ def process(symbol: str, signal: dict, book: str, *, broker: Broker,
               f"(max loss ${max_loss:,.0f}) — shadow only, not sent")
         return None
 
+    # Burn the dedup key BEFORE the order leaves: if the process dies between
+    # "Alpaca has it" and "the receipt is logged" (locked ledger, killed task,
+    # power loss), the next run must not send the same order again. A key
+    # burned for an order that never went out only costs a skipped trade; a
+    # key left unburned costs a duplicate position. Fail in the cheap
+    # direction. No `direction` here — that would claim a position the broker
+    # has not confirmed; only the receipt row below may open one.
+    ledger.append(run_date, book, "order_submitting", symbol=symbol,
+                  legs=legs, max_loss=max_loss, dedup_key=key)
+
     result = broker.submit_order(symbol, legs, key)
     # Broker receipt into the ledger (08-25 live test finding: order_intent
     # rows carried only the command preview — the actual order id / status
@@ -96,8 +106,9 @@ def process(symbol: str, signal: dict, book: str, *, broker: Broker,
                   direction=signal["direction"],
                   cli_commands=result["cli_commands"],
                   broker_receipt=receipt or None)
-    oid = f" order {receipt['id'][:8]}" if receipt.get("id") else ""
-    print(f"  [{book}] {symbol}: ORDER INTENT ({result['status']}{oid}) — "
+    oid = f" order {str(receipt['id'])[:8]}" if receipt.get("id") else ""
+    label = "ORDER REJECTED" if result["status"] == "error" else "ORDER INTENT"
+    print(f"  [{book}] {symbol}: {label} ({result['status']}{oid}) — "
           f"max loss ${max_loss:,.0f}")
     for cmd in result["cli_commands"]:
         print("      $ " + (cmd if isinstance(cmd, str) else " ".join(cmd)))
@@ -152,6 +163,11 @@ def main(argv: list[str] | None = None) -> int:
         print("--dry-run and --live are mutually exclusive.", file=sys.stderr)
         return 2
 
+    # Every `python -m` entry point loads .env itself (08-25 finding #2).
+    # broker_from_env() would do it too, but relying on that made the order
+    # implicit — and redteam_from_env() below reads GATED_AGENT_REDTEAM.
+    load_env()
+
     today = date.fromisoformat(args.date) if args.date else date.today()
     run_date = today.isoformat()
     ledger = Ledger(args.ledger) if args.ledger else Ledger()
@@ -176,7 +192,21 @@ def main(argv: list[str] | None = None) -> int:
     print(f"gated-agent {mode} — {run_date} "
           f"(equity ${broker.get_equity():,.0f}, {data}, {rt_name})")
 
-    sigs = {s: signals.live_signal(s) for s in signals.UNIVERSE}  # yfinance
+    # Signals come from a third party (yfinance). One symbol's fetch failing
+    # must not take the whole round with it — and above all must not prevent
+    # the close checks below from running: an unreachable data source is no
+    # reason to stop managing money that is already at risk.
+    errors = 0
+    sigs: dict[str, dict] = {}
+    for s in signals.UNIVERSE:
+        try:
+            sigs[s] = signals.live_signal(s)
+        except Exception as e:  # noqa: BLE001
+            errors += 1
+            ledger.append(run_date, "live", "signal_unavailable", symbol=s,
+                          error=f"{type(e).__name__}: {e}")
+            print(f"{s}: SIGNAL UNAVAILABLE ({type(e).__name__}) — skipped",
+                  file=sys.stderr)
 
     # Close checks come FIRST: exits (R1-R4, pre-registered config) run before
     # any new open, so a flip closes the old structure before the flip guard
@@ -187,20 +217,41 @@ def main(argv: list[str] | None = None) -> int:
                          dry_run=not args.live)
         except Exception as e:  # noqa: BLE001 — a failed close round must not
             # kill the run; unclosed positions keep the flip guard engaged.
+            errors += 1
             print(f"  [close] check failed ({type(e).__name__}: {e}); "
                   f"flip guard stays engaged for affected symbols")
     else:
         print("  [close] stub broker (no Alpaca keys): no positions to check")
 
     for symbol in signals.UNIVERSE:
-        sig = sigs[symbol]
+        sig = sigs.get(symbol)
+        if sig is None:
+            continue
         print(f"{symbol}: {sig['direction']} strength={sig['strength']:.2f} "
               f"spot={sig['spot']:.2f} (10-mo SMA trend)")
-        process(symbol, sig, "live", broker=broker, ledger=ledger,
-                redteam=redteam, run_date=run_date, today=today)
-        shadow = negctl.random_signal(run_date, symbol, sig["spot"])
-        process(symbol, shadow, "shadow", broker=broker, ledger=ledger,
-                redteam=redteam, run_date=run_date, today=today)
+        for book, s in (("live", sig),
+                        ("shadow", negctl.random_signal(run_date, symbol,
+                                                        sig["spot"]))):
+            try:
+                process(symbol, s, book, broker=broker, ledger=ledger,
+                        redteam=redteam, run_date=run_date, today=today)
+            except Exception as e:  # noqa: BLE001 — isolate per symbol/book:
+                # an Alpaca 500 on symbol 4 must not abandon symbol 5, and the
+                # dedup key of anything already sent is burned before the
+                # broker call, so retrying the day cannot duplicate an order.
+                errors += 1
+                ledger.append(run_date, book, "pipeline_error", symbol=symbol,
+                              error=f"{type(e).__name__}: {e}")
+                print(f"  [{book}] {symbol}: PIPELINE ERROR "
+                      f"({type(e).__name__}: {e})", file=sys.stderr)
+
+    if errors:
+        # No run_complete record: the day is NOT marked done, so the next
+        # invocation retries instead of idempotently skipping. Everything that
+        # already succeeded is protected by the dedup gate.
+        print(f"Completed with {errors} error(s) — day left open for retry. "
+              f"Decisions appended to {ledger.path}", file=sys.stderr)
+        return 1
 
     ledger.append(run_date, "live", "run_complete",
                   universe=list(signals.UNIVERSE))

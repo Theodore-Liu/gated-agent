@@ -158,15 +158,23 @@ class StubRedTeam(RedTeam):
 QUESTION_IDS = ("max_loss_scenario", "greeks_exposure", "liquidity_exit")
 
 _ROOT = Path(__file__).resolve().parents[2]          # src/gated_agent -> repo
+
+# Explicit override slot (tests / callers). None => resolve at call time.
 # Windows: `claude` is a .cmd shim; subprocess without shell needs the real path.
-CLAUDE_BIN = shutil.which("claude") or "claude"
+CLAUDE_BIN: str | None = None
 
 
 def _claude_bin() -> str:
-    """Resolve at CALL time, env first: .env is loaded after module import,
-    and a scheduled-task context may have no claude on PATH — an import-time
-    constant would freeze before CLAUDE_BIN from .env can take effect."""
-    return os.environ.get("CLAUDE_BIN") or CLAUDE_BIN
+    """Resolve at CALL time. Precedence: explicit override -> CLAUDE_BIN from
+    the environment (.env is loaded AFTER module import) -> a PATH probe.
+
+    The PATH probe is call-time too: `shutil.which` at import froze the answer
+    before load_env() had run *and* before any PATH the task context supplies,
+    which is precisely where the claude shim is missing. Unresolvable ->
+    "claude", which fails to launch, which fail-closes into a veto.
+    """
+    return (CLAUDE_BIN or os.environ.get("CLAUDE_BIN")
+            or shutil.which("claude") or "claude")
 
 READONLY_TOOLS = ",".join([
     "mcp__alpaca__get_account_info",

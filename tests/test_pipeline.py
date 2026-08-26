@@ -29,7 +29,10 @@ def test_live_book_produces_dry_run_order(tmp_path):
     assert result is not None and result["status"] == "dry_run"
     assert len(broker.submitted) == 1
     kinds = [r["kind"] for r in ledger.day(RUN_DATE, "live")]
-    assert kinds == ["signal", "gate_check", "redteam", "order_intent"]
+    # order_submitting is written BEFORE the broker call so a crash in the
+    # gap cannot yield a duplicate on the next run (see test_adversity.py).
+    assert kinds == ["signal", "gate_check", "redteam",
+                     "order_submitting", "order_intent"]
 
 
 def test_rerun_is_idempotent_via_dedup(tmp_path):
