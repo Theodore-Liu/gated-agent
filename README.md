@@ -109,6 +109,52 @@ or set `ALPACA_CLI`). `scripts/register_task.cmd` registers the weekday-
 morning scheduled task (`GatedAgentDaily`, hidden window, logs to
 `logs/daily.log`) — to be run on kickoff day.
 
+## Unattended operation (the context the agent actually runs in)
+
+The agent runs from Windows scheduled tasks for a week with nobody watching,
+so "it works when I run it by hand" is not evidence. Live-fire testing on
+08-25 found three bugs of one family — *works interactively, fails in the
+scheduled-task context* — and a sweep on 08-26 found the rest. Two properties
+of that context drive the design:
+
+**No working directory.** `schtasks /Create /TR` cannot set a start-in folder,
+so both tasks inherit `%windir%\system32`. Anything resolved against the CWD
+therefore means something different at 07:00 than it did in a shell.
+`src/gated_agent/paths.py` anchors every artifact — ledger, close log,
+position state, MCP config, `.env` — on the repo root instead, and the payload
+scripts `cd /d` there as well. This matters most for `ledger/decisions.jsonl`:
+dedup, once-per-day idempotency, the direction-flip guard and the daily loss
+halt all read that one file, so a second ledger in a second directory silently
+disarms all four at once.
+
+**No PATH, no inherited environment.** Every `python -m` entry point loads
+`.env` itself (`run`, `position_manager`, `chain_fetcher`, plus the Streamlit
+page), and nothing is resolved from the environment or from `PATH` at import
+time — imports happen before `.env` is read. Both properties are held by
+*structural* tests in `tests/test_scheduled_context.py` that scan the source,
+so a **new** entry point or module-level constant fails the suite rather than
+failing in production.
+
+**Both task payloads redirect stdout and stderr** to `logs/daily.log` /
+`logs/close_check.log`. A scheduled task without redirection fails silently
+with nothing to debug but `rc=1`.
+
+Adversity is exercised in `tests/test_adversity.py`: Alpaca 5xx, market
+closed, red-team timeout, locked ledger, rejected order. The rule in every
+case is fail **loudly** (non-zero exit, a ledger record) and **safely** (no
+order sent). Two consequences worth calling out:
+
+- The dedup key is written to the ledger *before* the order leaves. If the
+  process dies between "Alpaca has it" and "the receipt is logged", the retry
+  stands down instead of sending a duplicate. A burned key costs a skipped
+  trade; an unburned one costs a duplicate position — fail in the cheap
+  direction.
+- A rejected order opens nothing. Counting it would engage the flip guard
+  against a position that does not exist and that the close rules could never
+  clear, freezing that symbol in one direction for the rest of the week.
+- A failed signal fetch never blocks the close checks: an unreachable data
+  source is no reason to stop managing money already at risk.
+
 ## What's real today vs stubbed awaiting the account
 
 | Layer | Status |
