@@ -41,8 +41,10 @@ rem can open and cannot close is worse than one that does neither. The entry
 rem point now refuses up front with rc=2 rather than raising per structure.
 rem Both switches stay inside this setlocal - nothing leaks to the machine.
 
-rem set "ALPACA_HACKATHON_LIVE=1"
+rem COMPETITION MODE since 2026-08-28: both switches armed, matching
+rem run_daily.cmd - opens and closes go live together or not at all.
+set "ALPACA_HACKATHON_LIVE=1"
 
-"%ROOT%\.venv\Scripts\python.exe" -m gated_agent.position_manager >> "%LOG%" 2>&1
+"%ROOT%\.venv\Scripts\python.exe" -m gated_agent.position_manager --live >> "%LOG%" 2>&1
 echo exit code %ERRORLEVEL% >> "%LOG%"
 endlocal

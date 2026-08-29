@@ -26,11 +26,13 @@ if not exist "%ROOT%\.venv\Scripts\python.exe" (
   exit /b 1
 )
 
-rem Default mode is --dry-run. On go-live day (8/28+), after keys are in
-rem .env and a manual smoke test passed, change --dry-run to --live below
-rem AND set ALPACA_HACKATHON_LIVE=1 here (two independent switches).
-rem set "ALPACA_HACKATHON_LIVE=1"
+rem COMPETITION MODE since 2026-08-28 (go-live day, per the day-1 plan the
+rem user approved): keys in .env point at the dedicated competition account
+rem PA32VHBO5AOB and the manual first-round smoke passed, so both independent
+rem switches are armed. To stand down after 9/4: restore --dry-run and
+rem re-comment the set line.
+set "ALPACA_HACKATHON_LIVE=1"
 
-"%ROOT%\.venv\Scripts\python.exe" -m gated_agent.run --dry-run >> "%LOG%" 2>&1
+"%ROOT%\.venv\Scripts\python.exe" -m gated_agent.run --live >> "%LOG%" 2>&1
 echo exit code %ERRORLEVEL% >> "%LOG%"
 endlocal

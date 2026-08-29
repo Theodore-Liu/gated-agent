@@ -21,3 +21,6 @@ logs/
 bin/*.exe
 bin/*.zip
 bin/alpaca
+
+# dev-account ledger archive — account detail, backed up by snapshot_ledger.py
+ledger-devtest*/
