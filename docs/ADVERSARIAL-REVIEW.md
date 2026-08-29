@@ -463,3 +463,149 @@ contest behind the flip guard; a real position the ledger has forgotten lets
 the agent open against itself. Both were reachable from ordinary operation —
 an unfilled order, an expiry, a rehearsal — and both leave a log that looks
 completely healthy. The first of the two was already true of IWM this morning.
+
+---
+
+# Endgame review — 2026-08-29, five positions live, six trading days to expiry
+
+Day-1 is done: the competition account holds five call debit spreads (SPY /
+QQQ / IWM / NVDA expiring 9/11, AAPL expiring 9/4 — the ledger and the broker
+agree), both tasks fire weekdays with `StartWhenAvailable` confirmed set, and
+the submission deadline is 2026-09-04 15:00 UTC. This review walked every
+calendar day from here to expiry and attacked what actually happens on each
+one — with particular hostility toward the surface the 08-26 review and the
+08-28 live fixes created.
+
+## The calendar, day by day
+
+| Day | What fires | What happens |
+|---|---|---|
+| Sat 8/29 – Sun 8/30 | nothing | Positions held. Early assignment on a short call needs it ITM with no extrinsic; all five shorts are OTM with a week-plus of time value — and if it happens anyway, Monday's first round runs `reconcile()` + `detect_non_option_positions()` before anything else and shouts `assignment_suspected` on the dashboard. Nothing needs to run before Monday, and nothing does. |
+| Mon 8/31 | both tasks | Normal trading day. Verified in the Task Scheduler: next run 8/31 07:00, `StartWhenAvailable=True`, `MultipleInstances=IgnoreNew` on both. |
+| Tue 9/1 | both tasks | **Not a holiday — not even a Monday.** The hostile brief planted "Mon 9/1: Labor Day?" on purpose: 2026-09-01 is a **Tuesday**, and Labor Day 2026 is **Monday 9/7**. Normal trading day. The unrelated `TaxablePaperMonthly` task first-fires 9/1 at 18:30 PT — after the bell, different repo, and a boolean compare of the two `.env` files' `ALPACA_API_KEY` values (both set, **SAME=False**; no value printed) proves it cannot touch this account. |
+| Wed 9/2 | both tasks | **AAPL hits DTE = 2 → R1 at the 07:00 PT (10:00 ET) round**: market order out, `position_closed` with realized P&L, flip guard released. The same morning may legally re-open AAPL in the same direction at the next eligible expiry (mapper `min_dte=5`); that is a new structure with a new dedup key, by design. Traced end to end by a new test. |
+| Thu 9/3 | both tasks | Last full day. **Recommended stage-1 stand-down in the evening**, after the 12:15 round (plan below). Record the demo video today at the latest. |
+| Fri 9/4 | 07:00 task (if armed) · **submission 08:00 PT** | The 07:00 run fires **one hour before the judging snapshot** and, if still armed, can open fresh spreads whose entry cost immediately marks against the judged P&L. Not a bug — an operator decision; see the plan. |
+| Mon 9/7 | both tasks | **Labor Day.** Both entries ask `/v2/clock` first and fall back to the built-in calendar, which carries 9/7 (pre-existing test). Both exit 0 with a `market_closed` / "nothing checked" record. No order path is reachable. |
+| Tue 9/8 | both tasks | Normal day for whatever is still open. |
+| Wed 9/9 | both tasks | The four 9/11 spreads hit DTE = 2 → R1 market exits. **This is why stage 1 of the stand-down leaves the close task armed.** The shadow twin's 9/11 entries exit the same day by the same R1 (`shadow_exits`). |
+| Fri 9/11 | both tasks | Should already be flat. If not: residual risk #2. |
+
+## New defects
+
+### E1. R1 was not unconditional — a quote gap deferred it (HIGH, fixed)
+
+The frozen config, the README and the WRITEUP all say R1 closes
+*unconditionally* at DTE ≤ 2. The implementation checked the quote-gap branch
+first: a leg with no bid made the structure's value `None`, which meant
+"skip this round" for up to `MAX_QUOTE_GAPS = 3` rounds. A far-OTM short leg
+with no bid is not an outage — it is the **normal end-of-life state of exactly
+the spreads this account holds**. So the one rule whose entire purpose is
+"be out before pin/assignment week" was quietly subordinate to a counter meant
+for data outages.
+
+Walking the arithmetic: gaps starting at the 9/3 12:15 round would have put
+the force-close at 9/4 15:15 ET — 45 minutes before AAPL stops trading. The
+agent stayed out of disaster only because 3 gaps at 2 rounds/day happens to
+fit inside the R1 window. That property was accidental, and one skipped round
+(a locked ledger, a 5xx) would have broken it.
+
+**Fix.** In `evaluate()`: unpriceable **and** DTE ≤ `dte_close` → close at
+market *now*, rule `R1_time` — the same escalation R1 already uses when it can
+price the book. Strengthens the exit; weakens nothing. Two tests: the
+evaluate-level verdict, and an end-to-end assert that the executor is reached
+with a market order on the **first** gapped round inside the window.
+
+### E2. A rehearsed close released the flip guard (MEDIUM, fixed)
+
+`open_direction()` treated every `position_closed` as a release, including
+`dry_run: true` rows — written whenever close checks run without `--live`.
+The broker still holds the position a rehearsal "closed", so the belief was
+simply wrong, and reconcile re-adopting it one round later left a round-long
+window with the guard open against a live position. The configuration that
+produces this daily is exactly the one the stand-down plan creates (morning
+run dry-run, afternoon close task live).
+
+**Fix.** Only a real (`dry_run: false`) close releases the guard; a rehearsal
+changes nothing, because rehearsals change nothing at the broker either. Two
+pre-existing tests set up "believed flat" the rehearsal way and were updated
+to the live shape (a submitted close whose day order expired unfilled) — the
+same test-precondition class as §2.3; no assertion was weakened, and a new
+test pins the rehearsal case directly.
+
+## Attacks that failed (verified, not assumed)
+
+* **A −3% gap day through the actual gate arithmetic.** Equity ~$100k → halt
+  floor −$2,000. Marked-to-market damage shows up in the account's own
+  `equity − last_equity` long before our realized ledger sees anything, and
+  the worse-of rule (§1.3) halts on it. And the halt blocks **opens only**:
+  the same day's R3 stop-loss unwind still reaches the executor, because
+  `check_positions` never consults the gates — a halt that blocked exits would
+  lock in the very damage it exists to stop. New test pins both halves.
+* **The AAPL 9/2 → 9/4 sequence**, end to end in one test: R1 market order,
+  `position_closed` carrying `pnl`, flip guard released, and the money visible
+  to `realized_pnl` — all two days before the 9/4 08:00 PT snapshot.
+* **Labor Day** (both entries), **9/1-is-a-Tuesday**, **TaxablePaperMonthly
+  isolation** — table above.
+* **Catch-up double-fire**: `MultipleInstances=IgnoreNew` plus per-day
+  idempotency plus structure-keyed dedup. A late catch-up into a shut market
+  records `market_closed` and retries next round.
+
+## Residual risks — labeled, not fixed
+
+| # | Risk | Why it was left |
+|---|---|---|
+| 1 | **`position_closed` is written on submission, not on fill.** A crossed-price R2/R3/R4 day limit that still fails to fill leaves believed-flat/actually-open until the next round's reconcile re-adopts it; an unfilled R4 close followed by the same-run reverse open is the one remaining theoretical hedged-book window. | Crossing the spread (08-28 fix) makes a non-fill rare; the day order expires at the bell; reconcile self-heals next round. Polling fills to confirm closes is a real improvement but a bigger change than a contest-week review should install. |
+| 2 | **Riding to 9/11 expiry.** Requires three independent failures (priced R1 from 9/9 at 2 rounds/day, the new R1-with-gap market close, and the gap escalation). If it happens anyway: OCC auto-exercises ITM ≥ $0.01; a long-only-ITM leg exercises into 100 shares/contract (about $32k at AAPL 320, about $77k at SPY 771 — inside this account's cash for qty 1–2), held over a weekend, invisible to R1–R4, caught Monday by `detect_non_option_positions`. | Detection-not-management is unchanged from §2.4 and stated there. The defense is depth on the exit path, which E1 just deepened. |
+| 3 | **A late-waking box** can catch up the 07:00 task minutes after the 09:30 ET open, where an R1 market order pays the open's widest spread. | Bounded cost on a defined-risk vertical, and accepted: R1 must complete, and `StartWhenAvailable` is what turned a silent lost trading day into this smaller risk. |
+| 4 | **The 9/4 07:00 run trades one hour before judging** unless stage 1 has run. | Deliberately not coded. The agent must not decide by itself to stop trading inside the contest window; standing down is the operator's call, so it lives in a script an operator runs. |
+
+## Stand-down plan — prepared, not executed
+
+`scripts/stand_down.cmd` (thin ASCII wrapper over `scripts/stand_down.py`)
+exists as of this review. It is **not scheduled and has not been run**; both
+payloads remain armed and `ALPACA_HACKATHON_LIVE` was not touched by this
+review. Rehearsed against copies of both payloads: byte-exact minimal diffs,
+CRLF preserved, idempotent on re-run, and it refuses to write a half-disarmed
+payload.
+
+| Stage | When | Who | What |
+|---|---|---|---|
+| 1 — opens stand down | Evening 9/3 after the 12:15 round (or immediately after submitting on 9/4) | the user, or MBP over SSH | `scripts\stand_down.cmd` → `run_daily.cmd` back to `--dry-run`, live switch re-commented. **The close task stays armed on purpose**: the 9/11 spreads still need R1 to fire for real around 9/9. An agent that cannot open but can close is the safe shape; the reverse is not. |
+| 2 — closes stand down | After the account shows zero open positions (about 9/9) | same | `scripts\stand_down.cmd all`, then optionally `schtasks /Change /TN ... /DISABLE` (disable, not delete — the registration and its settings survive). |
+| — | each stage | same | Commit the changed payloads, so git history records when the agent stood down. |
+
+E2 is what makes stage 1 safe: before this review, the mixed configuration it
+creates would have had every rehearsed morning close releasing the flip guard
+on a still-open position.
+
+## Submission dry-run
+
+The five items, assembled against the form: repo URL (live), account
+`PA32VHBO5AOB` (verified by `verify_account_swap.py`, which prints facts and
+never key material), demo URL (**needs the Streamlit Community Cloud deploy —
+the one item that does not exist yet**), video and slides (placeholders; the
+only two requiring human production time, deadline 9/3 evening). Paste-ready
+form text and a morning-of checklist are in
+[`docs/SUBMISSION.md`](SUBMISSION.md). Nothing in this repo posts anywhere;
+the human submits.
+
+README and WRITEUP were refreshed to the shipped architecture — executable-
+side close pricing, R1 market escalation and its new gap non-deferral,
+per-expiry direction reading, real-close-only guard release, book-scoped
+red-team context — so a judge reading the docs reads the code that is running.
+
+## Scoreboard
+
+| | before | after |
+|---|---|---|
+| Tests | 214 | **219** |
+| Network calls made by the suite | 0 | **0** |
+
+Real defects found: **2 fixed** (E1 HIGH, E2 MEDIUM), **4 labeled** residual.
+Gates weakened: none — both fixes make an exit fire sooner or a guard hold
+longer. Orders placed: none. Live switches touched: none. The armed day-1
+payload state is recorded in git deliberately: an uncommitted armed script is
+one stray `git checkout` away from silently reverting a live agent to
+dry-run mid-contest, which is the "stopped trading and nothing said so"
+failure this project keeps refusing to allow.

@@ -262,7 +262,17 @@ class Ledger:
             elif kind in ("shadow_would_trade", "position_adopted"):
                 if r.get("direction"):
                     cur = r["direction"]
-            elif kind in ("position_closed", "position_reconciled"):
+            elif kind == "position_closed":
+                # 08-29 endgame review: a DRY-RUN close is a rehearsal — the
+                # broker still holds the position, so it must not release the
+                # flip guard. Before this check, the stand-down configuration
+                # (morning run dry-run, afternoon close task live) had every
+                # rehearsed close clear the belief and reconcile re-adopt it
+                # one round later — a window in which the guard was open
+                # against a position the account actually held.
+                if not r.get("dry_run"):
+                    cur = None
+            elif kind == "position_reconciled":
                 cur = None
         return cur
 

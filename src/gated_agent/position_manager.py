@@ -326,6 +326,20 @@ def evaluate(legs: list, mids: dict, today: date,
     base = {"entry": entry, "value": value, "dte": dte, "kind": kind}
 
     if value is None:
+        # 08-29 endgame review: this branch used to run BEFORE R1, so a leg
+        # with no bid — the NORMAL state of a far-OTM short leg in its final
+        # two days — deferred the "close unconditionally" rule behind the
+        # 3-round gap counter. With two rounds a day that could push the exit
+        # to expiry afternoon. R1 is frozen as unconditional; an unpriceable
+        # structure inside the R1 window goes out at market NOW, which is the
+        # same escalation R1 already uses when it can price the book.
+        if dte <= DTE_CLOSE:
+            return {**base, "action": "close", "rule": "R1_time",
+                    "order_type": "market", "quote_gaps": 0,
+                    "why": f"DTE {dte} <= {DTE_CLOSE} and a leg has no quote: "
+                           f"R1 is unconditional and does not wait out the "
+                           f"quote-gap counter this close to expiry (market "
+                           f"order)"}
         gaps = quote_gaps + 1
         if gaps >= MAX_QUOTE_GAPS:
             return {**base, "action": "close", "rule": "quote_gap",

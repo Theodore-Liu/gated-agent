@@ -491,15 +491,19 @@ def test_reconciliation_unfreezes_the_symbol_end_to_end(sandbox):
 
 def test_a_broker_position_the_ledger_forgot_is_adopted(sandbox):
     """The mirror image, and the one that costs money: the ledger believes flat
-    while the broker is long. Sources include a dry-run rehearsal writing a
-    position_closed for a close that never happened, and manual intervention.
+    while the broker is long. Sources include a REAL close whose limit order
+    was submitted, recorded, and then never filled (day order expired), and
+    manual intervention. (A dry-run rehearsal close no longer produces this
+    state at all — since the 08-29 endgame review it does not release the
+    belief; see test_a_dry_run_close_does_not_release_the_flip_guard.)
     Opening a short here would build the hedged book gate 4 exists to ban."""
     led = sandbox["ledger"]
     led.append("2026-08-30", "live", "order_intent", symbol="SPY",
                direction="long", status="submitted", dedup_key="k1",
                legs=[], max_loss=500.0)
     led.append("2026-08-30", "live", "position_closed", symbol="SPY",
-               rule="R2_take_profit", dry_run=True, why="rehearsal")
+               rule="R2_take_profit", dry_run=False,
+               why="close submitted; the day order expired unfilled")
     assert led.open_direction("SPY") is None                # believed flat
 
     close_checks({}, ledger=led, run_date=RUN_DATE, today=TODAY,
@@ -794,3 +798,116 @@ def test_shadow_closes_are_never_counted_as_realized_money(sandbox):
     led.append(RUN_DATE, "shadow", "position_closed", symbol="SPY",
                rule="R1_time", dry_run=False, pnl=-9999.0, why="shadow")
     assert led.realized_pnl(RUN_DATE) == 0.0
+
+
+# ══ (7) 2026-08-29 endgame review — the timeline from here to expiry ═════
+# Day-1 is live: five debit spreads on the competition account, AAPL expiring
+# 9/4 (submission day), the rest 9/11, tasks firing weekdays until someone
+# stands them down. These tests walk that calendar.
+
+EXP_R1 = date(2026, 9, 2)          # two days before an AAPL-style expiry
+YMD_R1 = EXP_R1.strftime("%y%m%d")
+R1_LONG, R1_SHORT = f"AAPL{YMD_R1}C00230000", f"AAPL{YMD_R1}C00240000"
+R1_POSITIONS = [{"occ_symbol": R1_LONG, "qty": 1, "entry": 5.00},
+                {"occ_symbol": R1_SHORT, "qty": -1, "entry": 2.00}]
+
+
+def test_r1_is_not_deferred_by_a_quote_gap():
+    """R1 is frozen as 'DTE <= 2 -> close unconditionally'. The implementation
+    checked the quote-gap branch FIRST, so a leg with no bid — the NORMAL
+    state of a far-OTM short leg in its final two days — deferred the
+    unconditional close behind the 3-round gap counter. At two rounds a day
+    that pushes the exit to expiry afternoon. Unpriceable inside the R1
+    window must mean market order NOW, same escalation R1 already uses."""
+    today = date(2026, 8, 31)                          # DTE = 2
+    mids = {R1_LONG: 7.00, R1_SHORT: None}             # short leg: no bid
+    legs = [{**p, **pm.parse_occ(p["occ_symbol"])} for p in R1_POSITIONS]
+    v = pm.evaluate(legs, mids, today)
+    assert v["action"] == "close"
+    assert v["rule"] == "R1_time"
+    assert v["order_type"] == "market"
+
+
+def test_r1_quote_gap_exit_reaches_the_executor_first_round(sandbox):
+    """End to end: the R1+gap close must go out on the FIRST round it is due,
+    not after MAX_QUOTE_GAPS rounds of 'skip'."""
+    mids = {R1_LONG: 7.00, R1_SHORT: None}
+    close_checks({}, ledger=sandbox["ledger"], run_date="2026-08-31",
+                 today=date(2026, 8, 31), positions=R1_POSITIONS, mids=mids,
+                 executor=sandbox["executor"])
+    assert len(sandbox["calls"]) == 1
+    assert sandbox["calls"][0]["order_type"] == "market"
+
+
+def test_a_dry_run_close_does_not_release_the_flip_guard(sandbox):
+    """A rehearsed close leaves the broker still holding the position. Before
+    this review, `open_direction` treated every position_closed as a release,
+    so the stand-down configuration (morning run dry-run, afternoon close
+    task live) rehearsed a close each morning, believed itself flat, and left
+    the flip guard open against a live position until reconcile re-adopted
+    it a round later. Only a REAL close may release the guard."""
+    led = sandbox["ledger"]
+    led.append("2026-09-08", "live", "order_intent", symbol="SPY",
+               direction="long", status="submitted", dedup_key="k9",
+               legs=[], max_loss=500.0)
+    led.append("2026-09-08", "live", "position_closed", symbol="SPY",
+               rule="R1_time", dry_run=True, why="rehearsal")
+    assert led.open_direction("SPY") == "long"          # guard stays engaged
+    led.append("2026-09-08", "live", "position_closed", symbol="SPY",
+               rule="R1_time", dry_run=False, why="the real unwind")
+    assert led.open_direction("SPY") is None            # real close releases
+
+
+def test_a_minus_three_percent_day_halts_opens_but_never_closes(sandbox):
+    """Walk a -3% gap day through the actual gate arithmetic: equity 100k,
+    the account's own equity-last_equity says -$3,000, floor is -$2,000 -> the
+    halt fires on every OPEN. And the same day's R3 stop-loss close must
+    still go out: closes run through position_manager, which never consults
+    the halt — a halt that blocked exits would lock in the damage it exists
+    to stop."""
+    strikes = {LONG_LEG: {"strike": 764.0, "type": "call"},
+               SHORT_LEG: {"strike": 783.0, "type": "call"}}
+    legs = [{"occ_symbol": LONG_LEG, "side": "buy", "qty": 1, "limit": 4.00},
+            {"occ_symbol": SHORT_LEG, "side": "sell", "qty": 1, "limit": 1.20}]
+    allowed, results, _ = run_gates(
+        legs=legs, strikes=strikes, equity=100_000.0,
+        realized_pnl_today=0.0, key="k", already_seen=False,
+        direction="long", open_direction=None, account_day_pnl=-3_000.0)
+    assert allowed is False
+    halt = [r for r in results if r.gate == "daily_loss_halt"][0]
+    assert halt.allowed is False
+
+    # entry E=+2.80; stop is V <= 1.40; mids give V = 2.50 - 1.20 = 1.30
+    mids_sl = {LONG_LEG: 2.50, SHORT_LEG: 1.20}
+    recs = close_checks({}, ledger=sandbox["ledger"], run_date=RUN_DATE,
+                        today=TODAY, positions=POSITIONS, mids=mids_sl,
+                        executor=sandbox["executor"])
+    assert recs[0]["rule"] == "R3_stop_loss"
+    assert len(sandbox["calls"]) == 1               # the exit went out
+
+
+def test_aapl_expiry_week_sequence(sandbox):
+    """The exact 9/2 sequence for the position expiring on submission day
+    (AAPL 9/4): the morning round fires R1 as a MARKET order, the close is
+    recorded with its realized P&L, the flip guard releases, and the money is
+    in `realized_pnl` — all two days before the 9/4 08:00 PT snapshot."""
+    led = sandbox["ledger"]
+    exp = date(2026, 9, 4)
+    ymd = exp.strftime("%y%m%d")
+    lo, sh = f"AAPL{ymd}C00230000", f"AAPL{ymd}C00240000"
+    led.append("2026-08-28", "live", "order_intent", symbol="AAPL",
+               direction="long", status="submitted", dedup_key="ka",
+               legs=[], max_loss=300.0)
+    positions = [{"occ_symbol": lo, "qty": 1, "entry": 5.00},
+                 {"occ_symbol": sh, "qty": -1, "entry": 2.00}]
+    mids = {lo: 6.50, sh: 2.50}                     # V=4.00, E=3.00
+    recs = close_checks({}, ledger=led, run_date="2026-09-02",
+                        today=date(2026, 9, 2), dry_run=False,
+                        positions=positions, mids=mids,
+                        executor=sandbox["executor"])
+    assert recs[0]["rule"] == "R1_time"
+    assert sandbox["calls"][0]["order_type"] == "market"
+    closed = [r for r in led.records() if r["kind"] == "position_closed"]
+    assert closed and closed[0]["pnl"] == 100.0     # (4.00-3.00)*100*1
+    assert led.open_direction("AAPL") is None       # guard released
+    assert led.realized_pnl("2026-09-02") == 100.0  # lands before 9/4

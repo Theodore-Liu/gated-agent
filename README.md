@@ -54,7 +54,7 @@ flowchart TD
     RT -->|live book| CLI["order_cli.py + cli_executor.py<br/>official Alpaca CLI · one atomic mleg per spread<br/>net limit: negative = credit<br/>--dry-run default · live needs ALPACA_HACKATHON_LIVE=1"]
     RT -->|shadow book| STOP["STOP — shadow never reaches the order path<br/>logged as would-trade only · exited by the same R1"]
 
-    EXITS -->|"unwinds: same mleg path, *_to_close intents<br/>quote-gap force-close goes out as a MARKET order"| CLI
+    EXITS -->|"unwinds: same mleg path, *_to_close intents<br/>priced at the executable side of the book<br/>R1 + quote-gap closes go out as MARKET orders"| CLI
     EXITS -.->|"position_closed record admits the reverse entry"| GATES
     RECON -.->|"position_reconciled / position_adopted"| GATES
 
@@ -75,11 +75,17 @@ R2 take profit (debit +50% / credit keep 50%), R3 stop loss (debit −50% /
 credit lose 1× premium), R4 close-before-flip — with parameters **frozen in
 [`config/close_rules.json`](config/close_rules.json)** before the run, never
 improvised intraday. The daily run evaluates closes **before** any new open,
-through the same atomic mleg CLI path (`*_to_close` intents). The signal only
-ever opens; a direction flip must wait until R4's close is confirmed as a
-`position_closed` ledger record (gate 4 reads exactly that). A structure whose
-quotes gap 3 rounds in a row is force-closed at market — never hold a position
-we can't see.
+through the same atomic mleg CLI path (`*_to_close` intents). Close orders are
+priced at the **executable side** of the book — sell the long leg at the bid,
+buy the short back at the ask; a mid-priced close rests instead of filling
+(measured live 08-26) — and R1 goes out at **market**: the one rule that must
+complete crosses the spread. The signal only ever opens; a direction flip must
+wait until R4's close is confirmed as a `position_closed` ledger record (gate 4
+reads exactly that — a *real* one, a rehearsed dry-run close does not release
+the guard). A structure whose quotes gap 3 rounds in a row is force-closed at
+market — never hold a position we can't see — and inside the R1 window an
+unpriceable structure closes at market **immediately**: R1 is unconditional and
+does not wait out the gap counter.
 
 **The believed book is reconciled against the actual book, every round.** Gate
 4 is only as good as the ledger's picture of what is open, and that picture is
@@ -93,7 +99,10 @@ before any open, `position_manager.reconcile()` compares the two and writes
 `position_reconciled` or `position_adopted`; **the account is the source of
 truth.** Direction is derived from the broker's own legs (`structure_direction`
 — bull call debit and bull put credit are long, bear call credit and bear put
-debit are short). See [docs/ADVERSARIAL-REVIEW.md](docs/ADVERSARIAL-REVIEW.md)
+debit are short), read **per expiry** and combined (`book_direction`), so a
+legal same-direction re-entry across two expiries is never mistaken for an
+empty book — an unreadable book is a loud unknown, never a silent release.
+See [docs/ADVERSARIAL-REVIEW.md](docs/ADVERSARIAL-REVIEW.md)
 §2.1, which caught this live: on 08-26 the ledger believed IWM was long and the
 broker held nothing.
 

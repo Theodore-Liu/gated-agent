@@ -97,7 +97,12 @@ def test_hold_writes_no_position_closed(sandbox):
 def test_flip_close_ordering_admits_reverse_entry(sandbox):
     """Day 1: open long. Day 2: reverse signal -> close checks run FIRST,
     R4 closes the long and records position_closed -> the flip gate then
-    admits the short open in the same run."""
+    admits the short open in the same run.
+
+    dry_run=False on the close phase, matching how run.main drives it in
+    --live mode: since the 08-29 endgame review only a REAL close releases
+    the flip guard — a rehearsed close leaves the broker still holding the
+    position, so it must not."""
     broker, ledger = AcceptedStubBroker(dry_run=True), sandbox["ledger"]
     rt_stub = StubRedTeam()
     day1 = process("SPY", dict(LONG_SIG), "live", broker=broker, ledger=ledger,
@@ -107,7 +112,7 @@ def test_flip_close_ordering_admits_reverse_entry(sandbox):
 
     # day 2, reverse signal: close phase first (as run.main orders it)
     recs = close_checks({"SPY": dict(SHORT_SIG)}, ledger=ledger,
-                        run_date=RUN_DATE, today=TODAY,
+                        run_date=RUN_DATE, today=TODAY, dry_run=False,
                         positions=POSITIONS, mids=MIDS_FLAT,
                         executor=sandbox["executor"])
     assert recs[0]["rule"] == "R4_signal_flip"   # flat P&L: only R4 fires
