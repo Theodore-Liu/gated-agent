@@ -41,7 +41,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 
 from .chain_fetcher import DATA, TRADING, _headers
-from .cli_executor import submit_legs
+from .cli_executor import ExecResult, submit_legs
 from .paths import ROOT
 
 _ROOT = ROOT                     # repo root, never the CWD (see paths.py)
@@ -291,29 +291,82 @@ def substructures(legs: list) -> list:
     return [by_exp[k] for k in sorted(by_exp)]
 
 
+def verticals(legs: list) -> list:
+    """Split an underlying's book back into the verticals it was opened as.
+
+    The broker reports positions per contract, not per structure. Two
+    same-direction spreads on one underlying (legal; happened on every name
+    on 2026-08-31) come back as one blob: different lot sizes per expiry
+    (AAPL 3 + 2, QQQ 2 + 1), or — when they share a long strike — a single
+    6-lot long against two 3-lot shorts (NVDA). Neither is one structure of
+    equal-qty legs, which is the only shape `submit_legs` can send.
+
+    Within each expiry and option type, every short leg is matched against a
+    long leg, lowest strike first, peeling the smaller quantity off both until
+    one side is exhausted; whatever is left stands alone. Every group returned
+    has equal quantities across its legs (signed, as on the book), at most two
+    legs, and is a plain vertical or a single contract — the two shapes this
+    agent has ever submitted. Positions are copied, never mutated.
+    """
+    out = []
+    for sub in substructures(legs):
+        for typ in ("call", "put"):
+            longs = sorted((dict(l) for l in sub if l["type"] == typ and l["qty"] > 0),
+                           key=lambda l: l["strike"])
+            shorts = sorted((dict(l) for l in sub if l["type"] == typ and l["qty"] < 0),
+                            key=lambda l: l["strike"])
+            while longs and shorts:
+                lo, sh = longs[0], shorts[0]
+                q = min(lo["qty"], -sh["qty"])
+                out.append([{**lo, "qty": q}, {**sh, "qty": -q}])
+                lo["qty"] -= q
+                sh["qty"] += q
+                if lo["qty"] == 0:
+                    longs.pop(0)
+                if sh["qty"] == 0:
+                    shorts.pop(0)
+            out.extend([l] for l in longs + shorts)
+    return out
+
+
 def book_direction(legs: list) -> str | None:
     """Direction of an underlying's whole book: the shared direction of its
-    per-expiry structures, or None when they genuinely disagree.
+    verticals, or None when they genuinely disagree.
 
     Never returns None merely because there is more than one structure — that
-    conflation is what released the guard on a live position.
+    conflation is what released the guard on a live position. Nor merely
+    because two structures share a strike: NVDA's 6/-3/-3 book read as
+    "direction unknown" on every round from 08-31 while being two bull call
+    spreads. A butterfly (long/short-short/long) still reads None — its two
+    verticals genuinely point opposite ways.
     """
-    dirs = {d for sub in substructures(legs)
-            if (d := structure_direction(sub)) is not None}
+    dirs = {d for v in verticals(legs)
+            if (d := structure_direction(v)) is not None}
     if len(dirs) == 1:
         return dirs.pop()
     return None
 
 
 def _signed_value(legs: list, price_of) -> float | None:
-    """V or E per structure unit; None if any leg has no price."""
+    """V or E per structure unit; None if any leg has no price.
+
+    Weighted by contracts. Summing per-leg prices once each was exact for one
+    equal-lot vertical and silently wrong for anything else: the 08-31
+    re-entries left NVDA holding a 6-lot long against two 3-lot shorts, and
+    this read its entry as 4.60 - 1.76 - 1.72 = 1.12 per unit against a true
+    2.86 — the "1:1 leg ratios" residual risk the 08-26 review said the order
+    path could not produce. R2/R3 are ratio rules, so dividing the
+    contract-weighted total by the largest lot leaves every equal-lot
+    structure at exactly its old number and prices a mixed book correctly.
+    """
+    units = max((abs(int(l["qty"])) for l in legs), default=0) or 1
     total = 0.0
     for leg in legs:
         px = price_of(leg)
         if px is None:
             return None
-        total += (1 if leg["qty"] > 0 else -1) * float(px)
-    return round(total, 4)
+        total += (1 if leg["qty"] > 0 else -1) * float(px) * abs(int(leg["qty"]))
+    return round(total / units, 4)
 
 
 def evaluate(legs: list, mids: dict, today: date,
@@ -416,6 +469,36 @@ def close_legs(legs: list, mids: dict, quotes: dict | None = None) -> list:
     return out
 
 
+def unwind_orders(legs: list, mids: dict, quotes: dict | None = None) -> list:
+    """The close of an underlying's whole book, as a list of submittable
+    orders — one per vertical, each with equal quantities across its legs.
+
+    Measured live 2026-09-01: the QQQ stop-loss (14:00Z) and the AAPL
+    take-profit (19:15Z) both triggered and both died in `submit_legs` with
+    "all legs must share the same qty", because `close_legs` reversed the
+    underlying's four legs as ONE order and the two spreads were sized
+    differently. IWM closed in the same round only because its two spreads
+    happened to be 4 and 4. Three of the four remaining names could not be
+    closed by any rule, R1 included.
+    """
+    return [close_legs(v, mids, quotes) for v in verticals(legs)]
+
+
+def book_pnl(legs: list, mids: dict) -> float | None:
+    """Realized dollars on the whole book, leg by leg: sign x (V - E) x 100 x
+    contracts. Equals `structure_pnl` on an equal-qty structure; on a
+    mixed-lot book (3 + 2) the per-unit formula times the smallest lot
+    under-reports, and this number feeds the -2% daily halt."""
+    total = 0.0
+    for leg in legs:
+        px = mids.get(leg["occ_symbol"])
+        if px is None:
+            return None
+        sign = 1 if leg["qty"] > 0 else -1
+        total += sign * (float(px) - float(leg["entry"])) * 100 * abs(int(leg["qty"]))
+    return round(total, 2)
+
+
 def structure_pnl(legs: list, entry: float | None, value: float | None
                   ) -> float | None:
     """Realized dollars on a closed structure: (V - E) x 100 x contracts.
@@ -508,16 +591,41 @@ def check_positions(flips: dict | None = None, *, dry_run: bool = True,
                                flip=und in flips, quote_gaps=gaps)
             rec.update(verdict)
             if verdict["action"] == "close":
-                unwind = close_legs(legs, mids)
                 order_type = verdict.get("order_type", "limit")
-                res = submit(unwind, dry_run=dry_run, order_type=order_type)
-                pnl = structure_pnl(legs, verdict["entry"], verdict["value"])
-                rec.update(legs=unwind, exec_ok=res.ok, dry_run=res.dry_run,
-                           pnl=pnl)
-                if res.ok and ledger is not None:
+                orders = unwind_orders(legs, mids)
+                # One order per vertical. A raise on the second must not hide
+                # that the first went out: every order gets its own result,
+                # and a book that is only partly closed is reported as such
+                # — loudly, and never as `position_closed`.
+                results = []
+                for order in orders:
+                    try:
+                        results.append(submit(order, dry_run=dry_run,
+                                              order_type=order_type))
+                    except Exception as e:           # noqa: BLE001
+                        results.append(ExecResult(
+                            False, dry_run, None, f"{type(e).__name__}: {e}"))
+                unwind = [l for o in orders for l in o]
+                ok = all(r.ok for r in results)
+                pnl = book_pnl(legs, mids)
+                rec.update(legs=unwind, exec_ok=ok,
+                           dry_run=all(r.dry_run for r in results), pnl=pnl,
+                           orders=[{"legs": o, "ok": r.ok, "raw": r.raw}
+                                   for o, r in zip(orders, results)])
+                if not ok:
+                    failed = [i for i, r in enumerate(results) if not r.ok]
+                    rec["error"] = (f"{len(failed)}/{len(orders)} unwind "
+                                    f"orders refused: " + "; ".join(
+                                        results[i].raw for i in failed))
+                    if ledger is not None:
+                        ledger.append(run_date or today.isoformat(), "live",
+                                      "close_check_error", symbol=und,
+                                      rule=verdict["rule"], error=rec["error"],
+                                      partial=len(failed) < len(orders))
+                elif ledger is not None:
                     ledger.append(run_date or today.isoformat(), "live",
                                   "position_closed", symbol=und,
-                                  rule=verdict["rule"], dry_run=res.dry_run,
+                                  rule=verdict["rule"], dry_run=rec["dry_run"],
                                   pnl=pnl, why=verdict["why"])
             state[und] = {"quote_gaps": verdict["quote_gaps"]}
         except Exception as e:                       # noqa: BLE001 -- isolate

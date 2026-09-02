@@ -436,7 +436,7 @@ was out of scope for a two-day-out review.
 |---|---|---|
 | 1 | **Early assignment is detected, not managed.** §2.4 alarms on assigned stock; the agent will not liquidate it, and the orphaned long leg still gets grouped as a fresh structure. | Auto-liquidating equity is a strategy decision, not a bug fix. R1 (DTE ≤ 2) already keeps the book out of the highest-assignment window. |
 | 2 | **Tick rounding can push the realised max loss slightly over the mapper's 1% budget.** The mapper sizes on the raw mid; the legs carry `_tick_round`ed limits, and for options ≥ $3.00 the $0.05 tick can add up to ~$5 per contract. | Bounded, small, and the independent 5%-of-equity gate still catches anything gross. Fixing it means the mapper sizing on rounded prices — a behaviour change worth its own testing window. |
-| 3 | **`_signed_value` assumes 1:1 leg ratios.** A structure with unequal leg quantities (partial assignment) would be mispriced by R2/R3. | Alpaca fills `mleg` atomically, so this could not be produced without fabricating a position shape the order path cannot create. |
+| 3 | **`_signed_value` assumes 1:1 leg ratios.** A structure with unequal leg quantities (partial assignment) would be mispriced by R2/R3. | ~~Alpaca fills `mleg` atomically, so this could not be produced without fabricating a position shape the order path cannot create.~~ **Wrong — it happened on 09-01** via a same-direction re-entry sharing a strike (NVDA 6/−3/−3). Fixed as L2 below; the close path's matching failure is L1. |
 | 4 | **No aggregate portfolio cap.** The 5% ceiling is per order; five symbols could in principle stack. | The mapper sizes each trade to 1% of equity, so practical worst case is ~5% total — but nothing *enforces* that, and it should be an explicit gate. |
 | 5 | **`records()` re-reads the file on every call**, so `open_positions()` is O(n²) in ledger rows. | Trivial at a week's scale (hundreds of rows, ~15 reads per run). Would matter over a month. |
 | 6 | **`--date` is unvalidated.** A typo produces a different `run_date` and therefore a different dedup namespace. | Manual-invocation-only footgun; the scheduled path never passes it. |
@@ -609,3 +609,90 @@ payload state is recorded in git deliberately: an uncommitted armed script is
 one stray `git checkout` away from silently reverting a live agent to
 dry-run mid-contest, which is the "stopped trading and nothing said so"
 failure this project keeps refusing to allow.
+
+---
+
+# What the market found — 2026-09-01, day 3 live
+
+Neither review found these. The live account did, and the close log recorded
+it in plain sight:
+
+```
+14:00Z  QQQ   R3_stop_loss     exec_ok=false  ValueError: all legs must share the same qty
+19:15Z  AAPL  R2_take_profit   exec_ok=false  ValueError: all legs must share the same qty
+19:15Z  IWM   R3_stop_loss     exec_ok=true   pnl -828.0
+```
+
+Two exits triggered by frozen rules, and the order never left the box. The
+cause was a legal event both reviews had already discussed: on 08-31 the
+signal re-entered every underlying in the same direction (the flip gate
+permits that; §"per-expiry direction reading" was written *because* of it).
+Each book became two spreads — and the second review's stated premise, that
+the order path "cannot create" a structure with unequal leg quantities
+(residual risk 3, above), was wrong in two ways at once.
+
+### L1. A mixed-lot book could not be closed by any rule (CRITICAL, fixed)
+
+`close_legs` reversed an underlying's **whole** book as one `mleg` order.
+`submit_legs` requires equal quantities per leg (the `ratio_qty = 1` model).
+The two spreads were sized independently by the 1%-of-equity mapper on
+different days, so they were different lots — AAPL 3 + 2, QQQ 2 + 1 — and the
+close was refused before it reached the CLI. IWM's close in the same round
+succeeded only because its lots happened to be 4 and 4. NVDA's two spreads
+share a long strike, so the broker reports one 6-lot long against two 3-lot
+shorts: unclosable by the same check, and read as `position_direction_unknown`
+on every round since 08-31.
+
+The exposure was not hypothetical. AAPL's 09-04 spread was inside its final
+three days; R1 — the one rule this document calls unconditional — would have
+raised the same error at 07:00 PT on 09-02, and the position would have ridden
+into the expiry that residual risk 2 walks through, on submission day.
+
+**Fix.** `verticals()` splits a book back into the spreads it was opened as:
+per expiry and option type, each short leg is matched to a long leg, lowest
+strike first, peeling the smaller lot off both. Every group is equal-lot, at
+most two legs, and a plain vertical or a single contract — the only two shapes
+this agent has ever submitted. `unwind_orders()` prices each with the existing
+`close_legs`; `check_positions` submits them one by one, records every
+result, and treats a partly refused unwind as a partial close: loud
+(`close_check_error` with `partial: true`), and never `position_closed`, so
+the flip guard stays engaged on a book that is still open. `book_direction`
+reads through the same decomposition, so NVDA is `long` again; a butterfly
+still reads `None`, because its two verticals genuinely disagree.
+
+Verified against the live book with the executor replaced by a preview:
+AAPL → two orders (3-lot 09-04, 2-lot 09-11), NVDA → two 3-lot orders on the
+shared 220 strike, QQQ → 2 + 1, SPY → 2 + 2. Every order passes the
+equal-qty check that refused today's two closes.
+
+### L2. A mixed-lot book was mispriced by R2/R3 (HIGH, fixed)
+
+`_signed_value` summed each leg's price **once**, regardless of quantity. On
+NVDA that read entry = 4.60 − 1.76 − 1.72 = **1.12** against a true per-spread
+cost of **2.86**, and value 1.46 against 2.31 — the stop and target the rules
+were watching were numbers no position had. On AAPL the 1-lot-weight summed
+the 3-lot and 2-lot spreads as equals, so the book's R2 ratio read 1.67 where
+the contract-weighted truth was 1.52. Same for `structure_pnl`, whose
+`(V − E) × min lot` under-reports a mixed book's dollars — and that figure
+feeds the −2% daily halt.
+
+**Fix.** `_signed_value` weights by contracts and divides by the largest lot,
+so every equal-lot structure keeps exactly its old number (all 219 prior tests
+unchanged) and a mixed book prices as its true ratio. `book_pnl` sums realized
+dollars leg by leg. R2/R3 thresholds untouched — they are ratios of a value
+that is now the book's actual value.
+
+Eight tests in `tests/test_mixed_lot_unwind.py`, built from the account's
+positions as of 09-01 evening. Tests: 219 → **227**.
+
+### What the reviews got wrong, stated plainly
+
+Residual risk 3 said unequal leg quantities "could not be produced without
+fabricating a position shape the order path cannot create." The order path
+created it twice over on the third live day, through the most ordinary event
+the agent has — a signal that stayed on. The lesson is the one this document
+keeps re-learning: the dangerous state is never the one the review declared
+impossible; it is the one the review declared *handled*.
+
+Orders placed by this fix: none. Rules changed: none. The next scheduled
+round (09-02 07:00 PT) is the first that can close AAPL, under R1, at market.
