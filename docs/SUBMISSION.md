@@ -1,10 +1,23 @@
 # Submission package — filled in advance, submitted by a human
 
-Deadline: **2026-09-04 15:00 UTC = 08:00 PT** (one hour after that morning's
-07:00 PT run — see the stand-down plan in ADVERSARIAL-REVIEW.md for why the
-book should be frozen the evening before). Nothing in this repo submits
-anything anywhere; this file is the text to paste, prepared so the deadline
-morning involves zero writing.
+Deadline: **Friday 2026-09-04 15:00 UTC = 08:00 PT** — verified 2026-09-01
+against the event page's own data (`endAt: 2026-09-04T15:00:00.000Z`;
+timeline entry "End of Submissions! Fri Sep 04 2026 17:00 CEST"), at
+https://lablab.ai/ai-hackathons/alpaca-ai-trading-agents-hackathon. That is
+one hour after the 07:00 PT run — see the stand-down plan in
+ADVERSARIAL-REVIEW.md for why the book should be frozen the evening before.
+**Plan: submit the form on Thursday 9/3 evening PT**, not on the deadline
+morning; every link is already live, so submitting early costs nothing and
+a 60-minute window on 9/4 is no buffer at all.
+
+Two things the event page requires that this package already satisfies:
+the Alpaca paper account ID must be on the form and must be a **fresh
+account created for the hackathon** (PA32VHBO5AOB was created for it and
+switched in on 08-28 — never reuse the dev account), and up to five X /
+LinkedIn post links may optionally be attached (none planned).
+
+Nothing in this repo submits anything anywhere; this file is the text to
+paste, prepared so submission involves zero writing.
 
 ## The five items
 
@@ -46,7 +59,7 @@ order — toy signal, real discipline.
 (read-only LLM red-team) · Alpaca market data (options chains + clock) ·
 Python, zero trading frameworks · Streamlit (read-only judge dashboard).
 
-## Pre-submission checklist (morning of 9/4, before 08:00 PT)
+## Pre-submission checklist (Thursday 9/3 evening PT; re-run the first item on the morning of 9/4)
 
 - [ ] Dashboard URL loads and shows the account (not a traceback).
 - [ ] `python scripts/verify_account_swap.py` — account ACTIVE, the P&L is
