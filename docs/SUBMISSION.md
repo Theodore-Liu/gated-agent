@@ -12,8 +12,8 @@ morning involves zero writing.
 |---|---|
 | Public repo URL | `https://github.com/Theodore-Liu/gated-agent` |
 | Demo URL | `https://gated-agent-live.streamlit.app` — LIVE since 08-24; secrets switched to the competition account on 08-28 and verified rendering it (equity ~$100k, the five day-1 spreads). **Re-check it renders on the morning of 9/4 before submitting** (liveness probe: `/healthz` — non-browser clients get a 303 on the main page, that is not an outage). |
-| Video link | `REPLACE-ME` — ≤3 min screen walk: dry run output → a gate veto → a red-team veto → the ledger → the dashboard. Record before 9/3 evening. |
-| Slides | `REPLACE-ME` — docs/WRITEUP.md is the narrative source; one slide per section. |
+| Video link | `https://github.com/Theodore-Liu/gated-agent/blob/main/docs/video.mp4` — 2:58, plays inline on GitHub. Beat sheet + narration: `docs/VIDEO-SCRIPT.md`; what is on screen and why it is real: `docs/MEDIA-BUILD-NOTES.md`. |
+| Slides | `https://github.com/Theodore-Liu/gated-agent/blob/main/docs/slides.pdf` — 7 pages; text source `docs/SLIDES.md`. |
 | Alpaca paper account | `PA32VHBO5AOB` |
 
 ## Suggested form text

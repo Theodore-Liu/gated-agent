@@ -24,3 +24,6 @@ bin/alpaca
 
 # dev-account ledger archive — account detail, backed up by snapshot_ledger.py
 ledger-devtest*/
+
+# media build intermediates (video/slides pipeline)
+media-work/
