@@ -19,15 +19,30 @@ LinkedIn post links may optionally be attached (none planned).
 Nothing in this repo submits anything anywhere; this file is the text to
 paste, prepared so submission involves zero writing.
 
-## The five items
+## The form, field by field
+
+The event page's "What to submit" list (read 2026-09-03) has twelve fields
+in three groups. Every one is prepared below; nothing needs writing at
+submission time.
 
 | Form field | Value |
 |---|---|
-| Public repo URL | `https://github.com/Theodore-Liu/gated-agent` |
-| Demo URL | `https://gated-agent-live.streamlit.app` — LIVE since 08-24; secrets switched to the competition account on 08-28 and verified rendering it (equity ~$100k, the five day-1 spreads). **Re-check it renders on the morning of 9/4 before submitting** (liveness probe: `/healthz` — non-browser clients get a 303 on the main page, that is not an outage). |
-| Video link | `https://github.com/Theodore-Liu/gated-agent/blob/main/docs/video.mp4` — 2:58, plays inline on GitHub. Beat sheet + narration: `docs/VIDEO-SCRIPT.md`; what is on screen and why it is real: `docs/MEDIA-BUILD-NOTES.md`. |
-| Slides | `https://github.com/Theodore-Liu/gated-agent/blob/main/docs/slides.pdf` — 7 pages; text source `docs/SLIDES.md`. |
-| Alpaca paper account | `PA32VHBO5AOB` |
+| **Basic information** | |
+| Project title | `Gated Agent` |
+| Short description | `An options agent that red-teams its own risk before every order — toy signal, real discipline.` |
+| Long description | the block quote under "Suggested form text" below, verbatim |
+| Technology & category tags | Alpaca Trading API · Alpaca MCP server · Alpaca CLI · Python · Streamlit · options trading · agents / risk management |
+| **Cover image, presentation and write-up** | |
+| Cover image | `docs/cover.png` — 1920×1080 title card (upload the file) |
+| Video presentation | `https://github.com/Theodore-Liu/gated-agent/blob/main/docs/video.mp4` — 2:58, plays inline on GitHub (raw file: `https://raw.githubusercontent.com/Theodore-Liu/gated-agent/main/docs/video.mp4`, 7.6 MB). Beat sheet + narration: `docs/VIDEO-SCRIPT.md`; what is on screen and why it is real: `docs/MEDIA-BUILD-NOTES.md`. **If the field only accepts a YouTube/Vimeo/Loom URL**, upload `docs/video.mp4` as an unlisted YouTube video and paste that link instead — the file is final, only the host changes. |
+| Slide presentation | `https://github.com/Theodore-Liu/gated-agent/blob/main/docs/slides.pdf` — 7 pages; text source `docs/SLIDES.md` (upload the PDF if the field wants a file). |
+| One-page write-up | `https://github.com/Theodore-Liu/gated-agent/blob/main/docs/WRITEUP.md` — exactly the three sections the event asks for (AI logic · risk gates · Alpaca infrastructure). Also slides 2–5. |
+| **App hosting and repository** | |
+| Public GitHub repository | `https://github.com/Theodore-Liu/gated-agent` |
+| Demo application platform | Streamlit Community Cloud |
+| Application URL | `https://gated-agent-live.streamlit.app` — LIVE since 08-24 on the competition account. **Open it in a browser right before submitting**: Community Cloud hibernates after ~12h without a real viewer session and greets the next visitor with a "Zzzz" wake-up screen (found asleep 09-03 16:10 PT; woken and re-verified rendering equity + positions at 16:14 PT). The hourly `GatedAgentDemoKeepAlive` task now drives a real browser session through Playwright (`scripts/keepalive_demo.py`) and clicks the wake-up button itself; its log line must read `ok: rendered`. `/healthz` returning 200 does **not** mean the app is awake. |
+| Alpaca paper trading account ID | `PA32VHBO5AOB` |
+| Social posts (optional, up to 5) | none |
 
 ## Suggested form text
 
@@ -61,10 +76,19 @@ Python, zero trading frameworks · Streamlit (read-only judge dashboard).
 
 ## Pre-submission checklist (Thursday 9/3 evening PT; re-run the first item on the morning of 9/4)
 
-- [ ] Dashboard URL loads and shows the account (not a traceback).
-- [ ] `python scripts/verify_account_swap.py` — account ACTIVE, the P&L is
-      the competition account's.
-- [ ] Repo pushed: `git status` clean, README renders on GitHub.
-- [ ] Video + slides links are world-viewable (open in an incognito window).
-- [ ] Book state as planned: AAPL 9/4 spread already closed by R1 (9/2);
-      remaining 9/11 spreads riding under the live close task.
+- [x] Dashboard URL loads and shows the account (not a traceback, not the
+      "Zzzz" sleep screen) — 09-03 16:14 PT: rendered equity $103,373 and
+      the open legs; keepalive task re-run through Task Scheduler, rc 0,
+      `ok: rendered`. **Re-open in a browser right before submitting.**
+- [x] `python scripts/verify_account_swap.py` — 09-03 16:05 PT: account
+      ACTIVE, options level 3, `PA32VHBO5AOB`, paper endpoint. (Its two
+      WARNs — equity ≠ $100k, positions ≠ 0 — are the swap-day checks; after
+      seven trading days on this account they are the expected state.)
+- [x] Repo pushed: `git status` clean, HEAD == origin/main, README renders.
+- [x] Video + slides links world-viewable — 09-03: GitHub blob pages and raw
+      files all HTTP 200 without a login (video 7.6 MB, slides 114 KB).
+- [x] Book state 09-03 close: NVDA and QQQ closed by R2 take-profit today
+      (+$2,229 and +$810 realized, lot-matched, all fills confirmed at the
+      broker); AAPL/IWM/SPY spreads riding (all in profit, none at target);
+      today's AAPL 9/18 open expired unfilled (reconcile drops it tomorrow).
+      Equity $103,373. Live close task continues through expiry.
