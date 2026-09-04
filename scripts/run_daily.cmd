@@ -31,8 +31,8 @@ rem user approved): keys in .env point at the dedicated competition account
 rem PA32VHBO5AOB and the manual first-round smoke passed, so both independent
 rem switches are armed. To stand down after 9/4: restore --dry-run and
 rem re-comment the set line.
-set "ALPACA_HACKATHON_LIVE=1"
+rem set "ALPACA_HACKATHON_LIVE=1"
 
-"%ROOT%\.venv\Scripts\python.exe" -m gated_agent.run --live >> "%LOG%" 2>&1
+"%ROOT%\.venv\Scripts\python.exe" -m gated_agent.run --dry-run >> "%LOG%" 2>&1
 echo exit code %ERRORLEVEL% >> "%LOG%"
 endlocal
